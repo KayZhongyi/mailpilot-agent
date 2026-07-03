@@ -1,119 +1,298 @@
 # MailPilot Agent
 
-**Crash-safe mail merge for AI agents** (Claude Code, Cowork, Codex CLI, Hermes).
+**Crash-safe mail merge for AI agents.**
 
-Point it at a recipient list and a template. It personalizes each email, shows you a preview to
-approve, sends in batches, tracks exactly what was sent, and reconciles bounces so you know what
-actually got through. It's a portable [Agent Skill](https://code.claude.com/docs/en/skills) — drop
-the folder into your agent and talk to it in plain language, or run the CLI directly.
+MailPilot Agent helps AI coding agents preview, send, resume, and reconcile personalized email batches from CSV/XLSX.
 
-> **You decide who gets what; the tool just sends it reliably.** Rows with no valid email or an
-> unknown template are flagged, never silently sent.
+It is designed for careful workflows like pre-sales follow-ups, event notifications, customer updates, and local-first automation.
+
+> Most email scripts just send. MailPilot previews first, skips unsafe rows, checkpoints every SMTP result, and resumes safely after interruption.
 
 ## Features
 
-- 📋 **Reads Excel/CSV** and auto-detects the email / name / group columns (English or Chinese headers).
-- ✍️ **Two modes** — *simple* (one template to everyone) or *grouped* (a `group` column picks a template per row).
-- 👀 **Preview before sending** — per-group counts, a rendered sample of each, and a list of un-sendable rows.
-- 🔁 **Crash-safe & resumable** — appends a per-email JSONL checkpoint before moving on; a re-run only sends what's left.
-- ⏰ **Schedule & throttle** — `--at "2026-07-02 09:00"`, `--sleep 2`.
-- 🧪 **Safe testing** — `--redirect-to you@example.com` sends the whole batch to yourself; `--dry-run` sends nothing.
-- 📈 **Delivery tracking** — `bounces` reads bounce notifications and marks undelivered rows with the reason.
-- 📨 **Better inbox rates** — adds a `List-Unsubscribe` header; works with any SMTP provider.
+- **Reads Excel/CSV** and auto-detects email, name, group, and sent-status columns.
+- **Simple and grouped modes**: send one template to everyone, or choose templates per row with a `group` column.
+- **Preview before sending**: see per-group counts, rendered samples, and unsafe rows before any email goes out.
+- **Crash-safe resume**: writes an append-only JSONL checkpoint after every SMTP result.
+- **Safe testing**: use `--dry-run`, `--redirect-to`, and `--limit` before real sending.
+- **Schedule and throttle**: send later with `--at`, or slow down batches with `--sleep`.
+- **Bounce reconciliation**: scan bounce notifications through IMAP and mark undelivered rows.
+- **Local-first**: no SaaS account, no telemetry, no database required.
+
+## Safety Demo
+
+Try the messy sample:
+
+```bash
+python scripts/mailer.py preview samples/messy_registrations.csv --out sendable.csv
+```
+
+The sample contains valid rows, empty emails, malformed emails, a missing template, and an already-sent row.
+
+MailPilot Agent will show:
+
+```text
+Read 5 row(s) -> wrote sendable.csv
+
+Will send (grouped by template, 1 total):
+  [confirmed] 1 email(s)
+
+Marked as already sent, will skip: 1 row(s)
+
+Cannot send, needs your attention: 3 row(s) (will NOT be sent)
+  - (no email): no valid email address
+  - (no email): no valid email address
+  - vip@example.com: template not found: templates/vip.txt
+```
+
+Nothing is sent during preview.
 
 ## Quickstart
 
+Install dependencies for direct folder usage:
+
 ```bash
-# 1. Install deps for direct folder usage
 pip install pandas openpyxl jinja2 pyyaml certifi
+```
 
-# 2. Configure. Fill in your APP PASSWORD (not your login password) — see references/
+Copy and edit the config:
+
+```bash
 cp config.example.yaml config.yaml
-python scripts/mailer.py doctor --config config.yaml     # verify deps / config / SMTP
+python scripts/mailer.py doctor --config config.yaml
+```
 
-# 3. Preview (review before sending)
-python scripts/mailer.py preview samples/event_registrations.csv --out sendable.csv     # auto-groups (confirmed / waitlist)
-#   simple mode (one email to all): preview samples/attendees.csv --template default
-#   messy data safety demo: preview samples/messy_registrations.csv --out sendable.csv
+Preview a grouped list:
 
-# 4. Test, then send for real
+```bash
+python scripts/mailer.py preview samples/event_registrations.csv --out sendable.csv
+```
+
+Preview a simple one-template list:
+
+```bash
+python scripts/mailer.py preview samples/attendees.csv --template default --out sendable.csv
+```
+
+Test before sending:
+
+```bash
 python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to you@example.com --limit 3
+```
+
+Send for real:
+
+```bash
 python scripts/mailer.py send --input sendable.csv --config config.yaml
+```
+
+Reconcile bounces:
+
+```bash
 python scripts/mailer.py bounces --input sendable.csv --config config.yaml --apply
 ```
 
-Optional installable CLI:
+## Installable CLI
+
+You can also install it as a local CLI:
 
 ```bash
 python -m pip install -e .
+```
+
+Then use:
+
+```bash
 mailpilot preview samples/event_registrations.csv --out sendable.csv
 mailpilot send --input sendable.csv --config config.yaml --dry-run
 ```
 
-Developer checks:
+Both commands are available:
 
 ```bash
-python -m pip install -e ".[dev]"
-mailpilot --help
-python -m ruff check .
-python -m pytest
+mailpilot
+mailpilot-agent
 ```
 
-## Using it conversationally (recommended for non-technical users)
+## How It Works
 
-In Cowork or Claude Code, just talk to it:
+MailPilot uses a review-first workflow:
 
-> "Group this list by the `status` column, then show me how many go to each and a sample of each."
-> "Looks good — send at 5pm and tell me the results."
+```text
+CSV/XLSX -> preview -> confirm -> send -> checkpoint ledger -> bounce reconciliation
+```
 
-The agent runs `doctor` → `preview` → waits for your OK → (optional test) → `send` → `bounces`, and
-walks you through the one manual step (getting your mail app password). **Run it inside a
-local-execution agent** — plain web chat can't reach mail servers.
+During sending, it sends one email at a time and appends the result to a JSONL ledger:
 
-## Crash-safe checkpointing
+```text
+sendable.csv.sendlog.jsonl
+```
 
-`send` is intentionally serial: it sends one message, records the result, then moves to the next.
-The checkpoint is an append-only JSONL file beside your send list, for example
-`sendable.csv.sendlog.jsonl`. If the process, terminal, or computer stops halfway through, run the
-same command again; the tool replays the ledger first and skips addresses already accepted by SMTP.
+If the process stops halfway through, run the same command again. MailPilot replays the ledger first and skips rows already accepted by SMTP.
 
-The CSV is still updated for convenience, but it is written atomically instead of rewritten after
-every single email. That keeps the recovery guarantee while avoiding huge write amplification on
-large batches.
+The CSV is still updated for convenience, but it is written atomically instead of being rewritten after every single email.
 
-## List format
+## List Format
 
 | column | required | notes |
-|--------|----------|-------|
-| email  | ✅ | headers containing `email` / `邮箱` are auto-detected |
-| name   | optional | used for the `{{ name }}` greeting |
-| group  | optional | presence enables grouped mode; value = template name |
-| sent   | optional | truthy rows (`yes`/`1`/`是`) are skipped (already sent) |
+| --- | --- | --- |
+| `email` | yes | headers containing `email` / `邮箱` are auto-detected |
+| `name` | optional | used for `{{ name }}` in templates |
+| `group` | optional | enables grouped mode; value should match a template name |
+| `sent` | optional | truthy rows such as `yes`, `1`, `是`, `已发送` are skipped |
 
-Try `samples/messy_registrations.csv` to see the safety checks in action: empty emails, malformed
-emails, missing templates, and already-sent rows are surfaced during preview instead of being sent.
+Chinese headers are supported for common fields such as email, name, group, and sent status.
 
 ## Templates
 
-Plain text + [Jinja2](https://jinja.palletsprojects.com/) in `templates/`. First line `Subject: ...`
-is the subject; the rest is the body. `{{ name }}` is filled per recipient.
+Templates are plain text files with Jinja2 variables.
 
-- Simple mode → `templates/default.txt` (or `--template <name>`).
-- Grouped mode → group value `confirmed` uses `templates/confirmed.txt`, etc.
+Example:
 
-## Providers & deliverability
+```text
+Subject: You're confirmed
+Hi {{ name }},
 
-Works with any SMTP provider — set `smtp.host/port/user/password` in `config.yaml`. **`password` must
-be an app password / authorization code, not your login password** (see
-[references/email_provider_setup.md](references/email_provider_setup.md)).
+Your spot is confirmed.
+```
 
-`send` marking a row `sent` means the server *accepted* it — not that it landed in the inbox. Spam
-placement is invisible to senders; use `bounces` to catch hard failures. For large blasts to external
-recipients, a transactional service (SES / SendGrid / Mailgun) delivers more reliably — only
-`config.yaml` changes.
+Templates live in:
 
-Only send to recipients who asked for or expect the email. Keep unsubscribed/bounced addresses out of
-future lists, throttle large batches, and include a working unsubscribe contact.
+```text
+templates/
+```
+
+Examples:
+
+```text
+templates/default.txt
+templates/confirmed.txt
+templates/waitlist.txt
+```
+
+In grouped mode, a row with `group=confirmed` uses:
+
+```text
+templates/confirmed.txt
+```
+
+## Common Commands
+
+Preview:
+
+```bash
+python scripts/mailer.py preview list.csv --out sendable.csv
+```
+
+Dry run:
+
+```bash
+python scripts/mailer.py send --input sendable.csv --config config.yaml --dry-run
+```
+
+Redirect all emails to yourself for testing:
+
+```bash
+python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to you@example.com --limit 3
+```
+
+Send only one group:
+
+```bash
+python scripts/mailer.py send --input sendable.csv --config config.yaml --only confirmed
+```
+
+Throttle sending:
+
+```bash
+python scripts/mailer.py send --input sendable.csv --config config.yaml --sleep 2
+```
+
+Schedule sending:
+
+```bash
+python scripts/mailer.py send --input sendable.csv --config config.yaml --at "2026-07-02 09:00"
+```
+
+## Configuration
+
+Copy:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+Fill in SMTP settings:
+
+```yaml
+smtp:
+  host: smtp.gmail.com
+  port: 465
+  use_ssl: true
+  user: you@example.com
+  password: YOUR_APP_PASSWORD_HERE
+
+from_addr: you@example.com
+from_name: Your Name
+unsubscribe: you@example.com
+```
+
+Use an **app password**, not your normal email password. See:
+
+```text
+references/email_provider_setup.md
+```
+
+## Deliverability Notes
+
+`send` marking a row as `sent` means the SMTP server accepted it. It does not guarantee inbox placement.
+
+For larger or recurring batches, use a transactional provider such as Amazon SES, SendGrid, Mailgun, or Aliyun DirectMail with SPF/DKIM/DMARC configured.
+
+MailPilot is designed for responsible workflows:
+
+- send only to recipients who expect the message
+- preview before sending
+- throttle larger batches
+- keep unsubscribed or bounced addresses out of future lists
+- include a working unsubscribe contact
+
+## Project Structure
+
+```text
+mailpilot-agent/
+  mailpilot/              # installable Python package
+  scripts/mailer.py       # direct folder entrypoint
+  templates/              # editable templates
+  samples/                # example CSV files
+  tests/                  # pytest tests
+  SKILL.md                # agent skill instructions
+  config.example.yaml     # SMTP config template
+```
+
+## Development
+
+Install dev dependencies:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+Run checks:
+
+```bash
+python -m pytest
+python -m ruff check .
+```
+
+## Roadmap
+
+- HTML email templates
+- Attachments
+- SQLite checkpoint ledger option
+- SendGrid / SES / Mailgun adapters
+- Better DSN bounce parsing
+- Richer preview reports
 
 ## License
 
