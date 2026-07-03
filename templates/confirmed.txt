@@ -1,0 +1,10 @@
+Subject: You're confirmed 🎉
+Hi {{ name }},
+
+Great news — your spot is confirmed! We'll send the joining details closer to the date.
+
+[GROUPED mode: rows whose "group" column is "confirmed" receive this email.
+Replace with your own content.]
+
+See you there,
+The Team

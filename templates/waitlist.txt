@@ -1,0 +1,11 @@
+Subject: You're on the waitlist
+Hi {{ name }},
+
+Thanks for signing up! We're currently at capacity, so you're on the waitlist for now. We'll email
+you the moment a spot opens up.
+
+[GROUPED mode: rows whose "group" column is "waitlist" receive this email.
+Replace with your own content.]
+
+Thanks for your patience,
+The Team

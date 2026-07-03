@@ -1,0 +1,37 @@
+# Copy this file to config.yaml and fill in your real values.
+# NEVER commit config.yaml — it holds a credential. (.gitignore already excludes it.)
+#
+# IMPORTANT: smtp.password must be an APP PASSWORD / authorization code,
+# NOT your normal login password. See references/email_provider_setup.md.
+
+smtp:
+  # --- Pick your provider. Defaults below are for Gmail; see the commented alternatives. ---
+  host: smtp.gmail.com
+  port: 465
+  use_ssl: true
+  user: you@example.com
+  password: YOUR_APP_PASSWORD_HERE      # app password / authorization code — NOT your login password
+
+  # Outlook / Microsoft 365:
+  #   host: smtp.office365.com
+  #   port: 587
+  #   use_ssl: false                    # Outlook uses STARTTLS on 587
+  # NetEase enterprise (@qiye.163.com):
+  #   host: smtphz.qiye.163.com
+  #   port: 465
+  #   use_ssl: true
+
+# Sender identity shown to recipients
+from_addr: you@example.com
+from_name: Your Name
+
+# Unsubscribe contact for the List-Unsubscribe header (improves bulk deliverability;
+# Gmail/Yahoo bulk-sender rules expect it). Email or https URL. Defaults to from_addr if omitted.
+unsubscribe: you@example.com
+
+# IMAP — only needed for the `bounces` command, which reads bounce notifications in your inbox.
+# Auto-derived from smtp.host if omitted (smtp -> imap). Override if your provider differs
+# (e.g. Outlook IMAP is outlook.office365.com, Gmail is imap.gmail.com).
+# imap:
+#   host: imap.gmail.com
+#   port: 993

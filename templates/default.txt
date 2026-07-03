@@ -1,0 +1,10 @@
+Subject: Reminder: our event is coming up
+Hi {{ name }},
+
+Just a quick reminder that our event is coming up soon — we're looking forward to seeing you there!
+
+[SIMPLE mode: this one message goes to everyone in your list. {{ name }} is replaced with each
+person's name. Replace this with your own content.]
+
+Cheers,
+The Team
