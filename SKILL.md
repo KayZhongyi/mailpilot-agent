@@ -27,6 +27,8 @@ track whether each one was sent and delivered. **Two modes:**
 - Grouped mode maps each row's group value directly to a template file: `confirmed` -> `templates/confirmed.txt`, `waitlist` -> `templates/waitlist.txt`. Missing templates are preview errors and are never sent.
 - **Rows with no valid email, or whose template can't be found, are surfaced for review and are NEVER sent automatically.**
 - Sending is **fail-closed on interruption**: `send` writes `attempting` before SMTP, then appends the result and atomically syncs the CSV. A result that cannot be proven becomes `unknown` and is never retried automatically.
+- Historical suppression is immutable after preview: clearing the current `status` does not make an originally `sent`, `bounced`, `unknown`, or suppressed row eligible again.
+- Once production starts, never create a replacement batch whose recipients overlap it. Reopen the original run and its ledger; mapping changes or a separate campaign require explicit reconciliation first.
 - **`send` marking a row `sent` only means "the mail server accepted it" — NOT that it was delivered.** Always run `bounces` afterward to reconcile.
 
 ## Workflow the agent should follow
@@ -35,7 +37,7 @@ track whether each one was sent and delivered. **Two modes:**
 2. **Prepare grouping if needed**: if the list already has a grouping column (`group`, `template`, `status`, `stage`, `segment`, `组别`, `报名状态`, etc.), use it. If not, ask the user for explicit rules and create a working CSV with a `group` column. The sending tool must not guess business segmentation on its own.
 3. **Preview**: user provides the list → run `preview` → read the per-group counts + one sample per group + the flagged un-sendable rows **out loud in the chat** for the user to review (do NOT email a report).
 4. **Wait for confirmation**: only proceed after the user says "send" (they may give a time). Send nothing before that.
-5. **Test first**: `send --redirect-to <user's test inbox> --limit 3` so they see the real emails. Redirected tests use a separate ledger and never mark customer rows as sent.
+5. **Test first**: `send --redirect-to <sender inbox> --limit 3` so they see the real emails. The test inbox must exactly equal the SMTP user/From address and must not be present in the customer list. Redirected tests use a separate ledger and never mark customer rows as sent.
 6. **Send for real in bounded batches**: always provide `--limit` (maximum 200) and `--sleep` (minimum 1 second for production). Start with a small batch and report accepted/error/unknown counts back.
 7. **Reconcile bounces**: run `bounces` to mark undelivered rows `bounced`, and report that list to the user (those need manual follow-up).
 
@@ -53,8 +55,8 @@ python scripts/mailer.py preview list.xlsx --template default --out sendable.csv
 python scripts/mailer.py preview list.xlsx --out sendable.csv        # auto-groups if a group column exists
 python scripts/mailer.py preview samples/messy_registrations.csv --out sendable.csv    # safety demo
 
-# Test send (redirect everything to a test inbox, a few at a time)
-python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to test@example.com --limit 3
+# Test send (use the SMTP user/From inbox, never a customer address)
+python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to sender@example.com --limit 3
 
 # Real send (idempotent; schedule / throttle / send one group)
 python scripts/mailer.py send --input sendable.csv --config config.yaml --limit 50 --sleep 2

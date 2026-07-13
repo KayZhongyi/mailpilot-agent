@@ -19,6 +19,7 @@ Deciding which group a row belongs to is your job (or the agent's, in chat) — 
 import argparse
 import email
 import hashlib
+import hmac
 import imaplib
 import json
 import os
@@ -61,7 +62,7 @@ GROUP_ALIASES = [
 SENT_ALIASES = ["sent", "sent_flag", "已发", "已发送", "是否已发", "是否已发送", "是否发送", "发送状态", "已发状态"]
 
 SUPPRESSED_STATUSES = {"sent", "error", "bounced", "unsubscribed", "suppressed", "unknown"}
-LEDGER_STATUSES = SUPPRESSED_STATUSES | {"attempting", "test_sent"}
+LEDGER_STATUSES = SUPPRESSED_STATUSES | {"attempting"}
 
 
 class LedgerIntegrityError(RuntimeError):
@@ -75,8 +76,9 @@ class BatchAlreadyLocked(RuntimeError):
 class BatchLock:
     """Small cross-platform, crash-released, non-blocking file lock."""
 
-    def __init__(self, path):
+    def __init__(self, path, blocking=False):
         self.path = path
+        self.blocking = blocking
         self.handle = None
 
     def __enter__(self):
@@ -88,9 +90,11 @@ class BatchLock:
                     self.handle.write("0")
                     self.handle.flush()
                 self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                mode = msvcrt.LK_LOCK if self.blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(self.handle.fileno(), mode, 1)
             else:
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                mode = fcntl.LOCK_EX if self.blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                fcntl.flock(self.handle.fileno(), mode)
         except OSError as e:
             self.handle.close()
             self.handle = None
@@ -125,11 +129,29 @@ def _decode_hdr(v):
 def _find_col(df, aliases):
     norm = {_norm(c): c for c in df.columns}
     for a in aliases:
-        na = _norm(a)
-        for nc, orig in norm.items():
-            if nc == na or na in nc:
-                return orig
-    return None
+        exact = norm.get(_norm(a))
+        if exact is not None:
+            return exact
+    candidates = []
+    aliases_norm = [_norm(a) for a in aliases]
+    for column in df.columns:
+        normalized = _norm(column)
+        if any(alias in normalized for alias in aliases_norm):
+            candidates.append(column)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _auto_col_candidates(df, aliases):
+    aliases_norm = {_norm(a) for a in aliases}
+    exact = [column for column in df.columns if _norm(column) in aliases_norm]
+    if exact:
+        return exact
+    candidates = []
+    for column in df.columns:
+        normalized = _norm(column)
+        if any(alias in normalized for alias in aliases_norm):
+            candidates.append(column)
+    return candidates
 
 
 def _find_exact_cols(df, aliases):
@@ -212,13 +234,121 @@ def _default_test_ledger_path(input_path):
     return f"{input_path}.testlog.jsonl"
 
 
-def _record_id(idx, email_addr, template, subject, body):
+def _ledger_anchor_path(ledger_path):
+    return f"{ledger_path}.started"
+
+
+def _check_ledger_presence(ledger_path):
+    anchor = _ledger_anchor_path(ledger_path)
+    if os.path.exists(anchor) and not os.path.exists(ledger_path):
+        raise LedgerIntegrityError(
+            f"Production ledger is missing but its start marker exists: {ledger_path}. "
+            "Do not resend until the batch is reconciled."
+        )
+    if os.path.exists(anchor) and os.path.exists(ledger_path) and os.path.getsize(ledger_path) == 0:
+        raise LedgerIntegrityError(
+            f"Production ledger is empty although sending was started: {ledger_path}."
+        )
+
+
+def _ensure_ledger_anchor(ledger_path, batch_id):
+    anchor = _ledger_anchor_path(ledger_path)
+    if os.path.exists(anchor):
+        try:
+            with open(anchor, encoding="utf-8") as f:
+                stored = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise LedgerIntegrityError(f"Production start marker is damaged: {anchor}") from e
+        if str(stored.get("batch_id", "")) != str(batch_id):
+            raise LedgerIntegrityError("Production start marker belongs to a different batch.")
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(anchor)) or ".", exist_ok=True)
     payload = json.dumps(
-        [int(idx), email_addr.lower(), template, subject, body],
+        {
+            "batch_id": str(batch_id),
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        fd = os.open(anchor, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return _ensure_ledger_anchor(ledger_path, batch_id)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_parent(anchor)
+
+
+def _record_id(
+    idx, email_addr, template, subject, body, sendable="yes", reason="", initial_status=""
+):
+    payload = json.dumps(
+        [
+            int(idx),
+            email_addr.lower(),
+            template,
+            subject,
+            body,
+            sendable,
+            reason,
+            initial_status,
+        ],
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _batch_id_for_record_ids(record_ids):
+    payload = json.dumps(list(record_ids), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_reviewed_batch(df):
+    required = {
+        "batch_id",
+        "record_id",
+        "email",
+        "template",
+        "subject",
+        "body",
+        "status",
+        "initial_status",
+        "sendable",
+        "reason",
+    }
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise LedgerIntegrityError(
+            f"Sendable file is missing review-manifest columns: {missing}. Run preview again."
+        )
+    normalized_batch_ids = [str(value).strip() for value in df["batch_id"]]
+    batch_ids = set(normalized_batch_ids)
+    if len(batch_ids) != 1 or not normalized_batch_ids or not normalized_batch_ids[0]:
+        raise LedgerIntegrityError("Sendable file must contain exactly one non-empty batch_id.")
+    expected_batch_id = _batch_id_for_record_ids(df["record_id"].astype(str))
+    if not hmac.compare_digest(normalized_batch_ids[0], expected_batch_id):
+        raise LedgerIntegrityError(
+            "Batch seal mismatch. Rows may have been removed, reordered, or replaced. Run preview again."
+        )
+    for idx, row in df.iterrows():
+        expected = _record_id(
+            idx,
+            str(row.get("email", "")).strip(),
+            str(row.get("template", "")).strip(),
+            str(row.get("subject", "")),
+            str(row.get("body", "")),
+            str(row.get("sendable", "")).strip().lower(),
+            str(row.get("reason", "")),
+            str(row.get("initial_status", "")).strip().lower(),
+        )
+        if not hmac.compare_digest(str(row.get("record_id", "")).strip(), expected):
+            raise LedgerIntegrityError(
+                f"Reviewed content mismatch at row {idx}. Run preview again; do not edit sendable.csv."
+            )
 
 
 def _atomic_write_csv(df, path):
@@ -243,17 +373,35 @@ def _atomic_write_csv(df, path):
             os.remove(tmp)
 
 
+def _fsync_parent(path):
+    try:
+        directory_fd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        # Directory fsync is not available on every platform (notably some Windows setups).
+        pass
+
+
 def _append_ledger(path, event):
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    new_file = not os.path.exists(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
         f.flush()
         os.fsync(f.fileno())
+    if new_file:
+        _fsync_parent(path)
 
 
 def _iter_ledger(path):
+    _check_ledger_presence(path)
     if not path or not os.path.exists(path):
         return
+    anchored = os.path.exists(_ledger_anchor_path(path))
+    seen_event = False
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
             line = line.strip()
@@ -270,7 +418,12 @@ def _iter_ledger(path):
                 raise LedgerIntegrityError(
                     f"Checkpoint ledger line {line_no} is not an event object: {path}"
                 )
+            seen_event = True
             yield event
+    if anchored and not seen_event:
+        raise LedgerIntegrityError(
+            f"Production ledger has no valid events although sending was started: {path}."
+        )
 
 
 def _apply_ledger(df, path):
@@ -287,7 +440,9 @@ def _apply_ledger(df, path):
             )
         current_email = str(df.at[idx, "email"]).strip().lower() if "email" in df.columns else ""
         event_email = str(ev.get("email", "")).strip().lower()
-        if event_email and current_email != event_email:
+        if not event_email:
+            raise LedgerIntegrityError(f"Checkpoint event at row {idx} has no email identity.")
+        if current_email != event_email:
             raise LedgerIntegrityError(
                 f"Checkpoint identity mismatch at row {idx}: ledger={event_email}, "
                 f"current={current_email}. Refusing unsafe recovery."
@@ -296,15 +451,25 @@ def _apply_ledger(df, path):
             str(df.at[idx, "record_id"]).strip() if "record_id" in df.columns else ""
         )
         event_record_id = str(ev.get("record_id", "")).strip()
+        if current_record_id and not event_record_id:
+            raise LedgerIntegrityError(f"Checkpoint event at row {idx} has no record_id identity.")
         if event_record_id and current_record_id and event_record_id != current_record_id:
             raise LedgerIntegrityError(
                 f"Checkpoint content mismatch at row {idx}. The reviewed email changed."
             )
+        current_batch_id = (
+            str(df.at[idx, "batch_id"]).strip() if "batch_id" in df.columns else ""
+        )
+        event_batch_id = str(ev.get("batch_id", "")).strip()
+        if current_batch_id and not event_batch_id:
+            raise LedgerIntegrityError(f"Checkpoint event at row {idx} has no batch_id identity.")
+        if event_batch_id and current_batch_id and event_batch_id != current_batch_id:
+            raise LedgerIntegrityError(f"Checkpoint batch mismatch at row {idx}.")
         status = str(ev.get("status", "")).strip()
         if status not in LEDGER_STATUSES:
-            continue
-        if status == "test_sent":
-            continue
+            raise LedgerIntegrityError(
+                f"Checkpoint event at row {idx} has unknown status {status!r}."
+            )
         latest[idx] = dict(ev)
 
     applied = 0
@@ -329,8 +494,26 @@ def _apply_ledger(df, path):
 
 def cmd_preview(args):
     df = read_table(args.file)
-    email_col = _require_column(df, args.email_col, "Email") or _find_col(df, EMAIL_ALIASES)
-    name_col = _require_column(df, args.name_col, "Name") or _find_col(df, NAME_ALIASES)
+    if args.email_col:
+        email_col = _require_column(df, args.email_col, "Email")
+    else:
+        email_candidates = _auto_col_candidates(df, EMAIL_ALIASES)
+        if len(email_candidates) > 1:
+            sys.exit(
+                "❌ Multiple possible email columns found: "
+                f"{email_candidates}. Choose the recipient column explicitly with --email-col."
+            )
+        email_col = email_candidates[0] if email_candidates else None
+    if args.name_col:
+        name_col = _require_column(df, args.name_col, "Name")
+    else:
+        name_candidates = _auto_col_candidates(df, NAME_ALIASES)
+        if len(name_candidates) > 1:
+            sys.exit(
+                "❌ Multiple possible name columns found: "
+                f"{name_candidates}. Choose one explicitly with --name-col."
+            )
+        name_col = name_candidates[0] if name_candidates else None
     requested_group = args.group_col
     if requested_group == "__none__":
         group_col = None
@@ -419,12 +602,23 @@ def cmd_preview(args):
             status = "sent"
             present_cnt += 1
 
-        record_id = _record_id(source_idx, email_v or "", tpl, subject, body)
+        sendable_value = "yes" if sendable else "no"
+        record_id = _record_id(
+            source_idx,
+            email_v or "",
+            tpl,
+            subject,
+            body,
+            sendable_value,
+            reason,
+            status,
+        )
         rows.append({
             "record_id": record_id,
             "name": name, "email": email_v or "", "template": tpl,
             "subject": subject, "body": body, "status": status,
-            "sendable": "yes" if sendable else "no", "reason": reason,
+            "initial_status": status,
+            "sendable": sendable_value, "reason": reason,
             "send_time": "", "send_error": "",
         })
         if sendable and status != "sent":
@@ -432,8 +626,7 @@ def cmd_preview(args):
         if not sendable:
             unsendable.append((email_v or "(no email)", reason))
 
-    batch_material = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    batch_id = hashlib.sha256(batch_material.encode("utf-8")).hexdigest()
+    batch_id = _batch_id_for_record_ids(row["record_id"] for row in rows)
     out = pd.DataFrame(rows)
     out.insert(0, "batch_id", batch_id)
     out.to_csv(args.out, index=False, encoding="utf-8-sig")
@@ -511,6 +704,8 @@ def _send_message_id(record_id, from_addr):
 
 def _cmd_send_locked(args):
     df = pd.read_csv(args.input, dtype=object).fillna("")
+    if not args.dry_run:
+        _validate_reviewed_batch(df)
     production_ledger = args.ledger or _default_ledger_path(args.input)
     event_ledger = (
         _default_test_ledger_path(args.input) if args.redirect_to else production_ledger
@@ -522,7 +717,9 @@ def _cmd_send_locked(args):
     for idx, r in df.iterrows():
         if str(r.get("sendable", "")).strip().lower() not in ("yes", "true", "1"):
             continue
-        if str(r.get("status", "")).strip().lower() in SUPPRESSED_STATUSES:
+        current_status = str(r.get("status", "")).strip().lower()
+        initial_status = str(r.get("initial_status", "")).strip().lower()
+        if current_status in SUPPRESSED_STATUSES or initial_status in SUPPRESSED_STATUSES:
             continue
         tpl = str(r.get("template", "")).strip()
         if args.only and tpl != args.only:
@@ -564,20 +761,46 @@ def _cmd_send_locked(args):
     if args.at:
         _wait_until(args.at)
 
-    cfg = load_config(args.config)
+    config_data = getattr(args, "config_data", None)
+    cfg = normalize_config(config_data) if config_data is not None else load_config(args.config)
+    if args.redirect_to:
+        redirect_address = (_valid_email(args.redirect_to) or "").lower()
+        allowed_test_addresses = {
+            str(cfg.get("user", "")).strip().lower(),
+            str(cfg.get("from_addr", "")).strip().lower(),
+        }
+        customer_addresses = {to.lower() for _, _, _, to in targets}
+        if not redirect_address or redirect_address not in allowed_test_addresses:
+            sys.exit(
+                "❌ Test redirect must exactly match the SMTP account or From address."
+            )
+        if redirect_address in customer_addresses:
+            sys.exit(
+                "❌ Test redirect is also a customer recipient. Use a separate sender test inbox."
+            )
     server = connect_smtp(cfg)
     unsub = _unsubscribe_header(cfg.get("unsubscribe"))
     sent = 0
     attempted = 0
     stop_after_current = False
     try:
+        if not args.redirect_to:
+            _ensure_ledger_anchor(production_ledger, str(df["batch_id"].iloc[0]))
         for idx, r, tpl, to in targets:
             if attempted >= args.limit:
                 break
             actual = args.redirect_to or to
             record_id = str(r.get("record_id", "")).strip() or _record_id(
-                idx, to, tpl, str(r.get("subject", "")), str(r.get("body", ""))
+                idx,
+                to,
+                tpl,
+                str(r.get("subject", "")),
+                str(r.get("body", "")),
+                str(r.get("sendable", "")).strip().lower(),
+                str(r.get("reason", "")),
+                str(r.get("initial_status", "")).strip().lower(),
             )
+            batch_id = str(r.get("batch_id", "")).strip()
             attempt_id = uuid.uuid4().hex
             attempt_time = datetime.now().astimezone().isoformat(timespec="seconds")
             msg = MIMEMultipart()
@@ -592,6 +815,7 @@ def _cmd_send_locked(args):
                 "event": "send_attempt",
                 "attempt_id": attempt_id,
                 "row": int(idx),
+                "batch_id": batch_id,
                 "record_id": record_id,
                 "email": to,
                 "actual_recipient": actual,
@@ -612,6 +836,7 @@ def _cmd_send_locked(args):
                     "event": "send_result",
                     "attempt_id": attempt_id,
                     "row": int(idx),
+                    "batch_id": batch_id,
                     "record_id": record_id,
                     "email": to,
                     "actual_recipient": actual,
@@ -636,6 +861,7 @@ def _cmd_send_locked(args):
                         "event": "test_result" if args.redirect_to else "send_result",
                         "attempt_id": attempt_id,
                         "row": int(idx),
+                        "batch_id": batch_id,
                         "record_id": record_id,
                         "email": to,
                         "actual_recipient": actual,
@@ -722,7 +948,7 @@ def _extract_bounces(cfg, lookback):
     return bounced
 
 
-def cmd_bounces(args):
+def _cmd_bounces_locked(args):
     cfg = load_config(args.config)
     df = pd.read_csv(args.input, dtype=object).fillna("")
     ledger_path = args.ledger or _default_ledger_path(args.input)
@@ -753,6 +979,8 @@ def cmd_bounces(args):
         _append_ledger(ledger_path, {
             "event": "bounce_result",
             "row": int(idx),
+            "batch_id": str(df.at[idx, "batch_id"]) if "batch_id" in df.columns else "",
+            "record_id": str(df.at[idx, "record_id"]) if "record_id" in df.columns else "",
             "email": to,
             "status": "bounced",
             "send_error": bounced[to],
@@ -762,6 +990,14 @@ def cmd_bounces(args):
         df.at[idx, "send_error"] = bounced[to]
     _atomic_write_csv(df, args.input)
     print(f"\n✅ Marked {len(matched)} row(s) as bounced. Ledger: {ledger_path}. Wrote reasons to {args.input}")
+
+
+def cmd_bounces(args):
+    try:
+        with BatchLock(f"{args.input}.lock"):
+            return _cmd_bounces_locked(args)
+    except BatchAlreadyLocked:
+        sys.exit("❌ This batch is currently sending. Bounce reconciliation must wait.")
 
 
 # ---------------- doctor ----------------
@@ -803,11 +1039,9 @@ def cmd_doctor(args):
 
 # ---------------- shared: config / SMTP ----------------
 
-def load_config(path):
-    if not path or not os.path.exists(path):
-        sys.exit(f"❌ Config file not found: {path}\n   Copy config.example.yaml to config.yaml and fill in your app password.")
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+def normalize_config(cfg):
+    if not isinstance(cfg, dict):
+        sys.exit("❌ SMTP configuration must be a mapping.")
     smtp = cfg.get("smtp", {})
     imap = cfg.get("imap", {})
     smtp_host = smtp.get("host")
@@ -833,6 +1067,14 @@ def load_config(path):
             or ("YOUR_" in pw.upper() and "HERE" in pw.upper()):
         sys.exit("❌ smtp.password is still the placeholder — set it to a real app password (not your login password). See references/email_provider_setup.md.")
     return merged
+
+
+def load_config(path):
+    if not path or not os.path.exists(path):
+        sys.exit(f"❌ Config file not found: {path}\n   Copy config.example.yaml to config.yaml and fill in your app password.")
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return normalize_config(cfg)
 
 
 def _ssl_context():

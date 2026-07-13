@@ -16,10 +16,10 @@ import os
 import secrets
 import shutil
 import tempfile
+import threading
 import webbrowser
 
 import pandas as pd
-import yaml
 from flask import Flask, redirect, render_template_string, request, url_for
 
 from mailpilot import mailer
@@ -29,8 +29,13 @@ ROOT = Path(__file__).resolve().parent
 TEMPLATES_DIR = ROOT / "templates"
 RUNS_DIR = ROOT / ".mailpilot_runs"
 RUNS_DIR.mkdir(exist_ok=True)
+mailer._fsync_parent(RUNS_DIR)
+for stale_pattern in ("mailpilot_*/smtp-*.yaml", "mailpilot_*/config.yaml"):
+    for stale_config in RUNS_DIR.glob(stale_pattern):
+        stale_config.unlink(missing_ok=True)
 
 app = Flask(__name__)
+CAPTURE_LOCK = threading.Lock()
 
 CSS = """
 :root {
@@ -464,7 +469,8 @@ PAGE = """
               <div class="row">
                 <div>
                   <label>Redirect all emails to test inbox</label>
-                  <input name="redirect_to" placeholder="you@example.com">
+                  <input name="redirect_to" placeholder="Must match SMTP user or From address">
+                  <p class="help">For safety, this must be your sender test inbox and must not appear in the customer list.</p>
                 </div>
                 <div>
                   <label>Only group/template</label>
@@ -538,8 +544,10 @@ PAGE = """
 def _capture(func, args):
     buf = io.StringIO()
     try:
-        with redirect_stdout(buf):
-            func(args)
+        # redirect_stdout mutates process-global state, so captured commands must not overlap.
+        with CAPTURE_LOCK:
+            with redirect_stdout(buf):
+                func(args)
         return True, buf.getvalue()
     except SystemExit as e:
         return False, f"{buf.getvalue()}\n{e}".strip()
@@ -558,12 +566,31 @@ def _metric_counts(df):
         return {"ready": 0, "skipped": 0, "blocked": 0}
     sendable = df["sendable"].astype(str).str.lower().isin(["yes", "true", "1"])
     status = df["status"].astype(str).str.lower() if "status" in df else pd.Series("", index=df.index)
-    suppressed = status.isin(mailer.SUPPRESSED_STATUSES)
+    initial_status = (
+        df["initial_status"].astype(str).str.lower()
+        if "initial_status" in df
+        else pd.Series("", index=df.index)
+    )
+    suppressed = status.isin(mailer.SUPPRESSED_STATUSES) | initial_status.isin(
+        mailer.SUPPRESSED_STATUSES
+    )
     return {
         "ready": int((sendable & ~suppressed).sum()),
         "skipped": int((sendable & suppressed).sum()),
         "blocked": int((~sendable).sum()),
     }
+
+
+def _pending_templates(df):
+    sendable = df["sendable"].astype(str).str.lower().isin(["yes", "true", "1"])
+    status = df["status"].astype(str).str.lower()
+    initial_status = df["initial_status"].astype(str).str.lower()
+    pending = df[
+        sendable
+        & ~status.isin(mailer.SUPPRESSED_STATUSES)
+        & ~initial_status.isin(mailer.SUPPRESSED_STATUSES)
+    ]
+    return sorted(set(pending["template"].astype(str)))
 
 
 def _table_html(df):
@@ -577,11 +604,58 @@ def _table_html(df):
 def _content_hash(df):
     columns = [
         c
-        for c in ("record_id", "email", "template", "subject", "body", "sendable", "reason")
+        for c in (
+            "record_id",
+            "email",
+            "template",
+            "subject",
+            "body",
+            "initial_status",
+            "sendable",
+            "reason",
+        )
         if c in df.columns
     ]
     payload = df[columns].fillna("").astype(str).to_csv(index=False, lineterminator="\n")
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _batch_fingerprint(df):
+    fields = (
+        "email",
+        "template",
+        "subject",
+        "body",
+        "status",
+        "initial_status",
+        "sendable",
+        "reason",
+    )
+    rows = []
+    for _, row in df.iterrows():
+        normalized = []
+        for field in fields:
+            value = str(row.get(field, "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+            normalized.append(value.lower() if field == "email" else value)
+        rows.append(normalized)
+    payload = json.dumps(sorted(rows), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recipient_set_hash(df):
+    recipients = sorted(str(value).strip().lower() for value in df["email"] if str(value).strip())
+    payload = json.dumps(recipients, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recipient_hashes(df):
+    return sorted(
+        {
+            hashlib.sha256(str(value).strip().lower().encode("utf-8")).hexdigest()
+            for value in df["email"]
+            if str(value).strip()
+        }
+    )
 
 
 def _template_names():
@@ -596,8 +670,7 @@ def _template_files():
     ]
 
 
-def _write_config(run_dir, form):
-    config_path = Path(run_dir) / f"smtp-{secrets.token_hex(8)}.yaml"
+def _config_from_form(form):
     user = form.get("user", "").strip()
     from_addr = form.get("from_addr", "").strip() or user
     config = {
@@ -612,9 +685,44 @@ def _write_config(run_dir, form):
         "from_name": form.get("from_name", "").strip(),
         "unsubscribe": form.get("unsubscribe", "").strip() or from_addr,
     }
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    os.chmod(config_path, 0o600)
-    return config_path
+    mailer.normalize_config(config)
+    return config
+
+
+def _smtp_identity(form):
+    user = form.get("user", "").strip().lower()
+    return {
+        "host": form.get("host", "").strip().lower(),
+        "port": int(form.get("port", "465") or 465),
+        "use_ssl": bool(form.get("use_ssl")),
+        "user": user,
+        "from_addr": (form.get("from_addr", "").strip() or user).lower(),
+        "from_name": form.get("from_name", "").strip(),
+        "unsubscribe": form.get("unsubscribe", "").strip(),
+    }
+
+
+def _write_test_marker(run_dir, df, templates, form):
+    payload = {
+        "content_hash": _content_hash(df),
+        "templates": sorted(templates),
+        "smtp_identity": _smtp_identity(form),
+        "tested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    (Path(run_dir) / "redirect-test-passed.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _read_test_marker(run_dir):
+    path = Path(run_dir) / "redirect-test-passed.json"
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _safe_paths(sendable_path, run_dir):
@@ -667,23 +775,186 @@ def _write_manifest(run_dir, **values):
             current = {}
     current.update(values)
     tmp = path.with_suffix(f".{secrets.token_hex(6)}.tmp")
-    tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    with tmp.open("x", encoding="utf-8") as f:
+        f.write(json.dumps(current, ensure_ascii=False, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    mailer._fsync_parent(path)
 
 
-def _find_existing_batch(source_hash, exclude=None):
+def _write_hash_sidecar(run_dir, name, value):
+    path = Path(run_dir) / name
+    with path.open("x", encoding="ascii") as f:
+        f.write(value)
+        f.flush()
+        os.fsync(f.fileno())
+    mailer._fsync_parent(path)
+
+
+def _write_recipient_index(run_dir, df):
+    path = Path(run_dir) / "recipient-index.json"
+    with path.open("x", encoding="utf-8") as f:
+        json.dump(_recipient_hashes(df), f, ensure_ascii=False, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    mailer._fsync_parent(path)
+
+
+def _ensure_production_marker(run_dir, df):
+    path = Path(run_dir) / "production.started"
+    if path.exists():
+        return
+    payload = json.dumps(
+        {
+            "content_hash": _content_hash(df),
+            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        with path.open("x", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+    except FileExistsError:
+        return
+    mailer._fsync_parent(path)
+
+
+def _remove_run(run_dir):
+    run_dir = Path(run_dir)
+    shutil.rmtree(run_dir)
+    mailer._fsync_parent(run_dir)
+
+
+def _find_source_batches(source_hash, exclude=None):
+    """Find every run made from the same bytes, even if its manifest is damaged."""
+    RUNS_DIR.mkdir(exist_ok=True)
+    matches = []
+    for run in RUNS_DIR.glob("mailpilot_*"):
+        if exclude and run == exclude:
+            continue
+        candidate_hashes = []
+        sidecar = run / "source.sha256"
+        if sidecar.exists():
+            try:
+                candidate_hashes.append(sidecar.read_text(encoding="ascii").strip())
+            except OSError:
+                pass
+        for source in (run / "recipients.csv", run / "recipients.xlsx"):
+            if source.exists():
+                try:
+                    candidate_hashes.append(_sha256_path(source))
+                except OSError:
+                    pass
+        manifest = run / "manifest.json"
+        if manifest.exists():
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                candidate_hashes.append(str(data.get("source_hash", "")))
+            except (OSError, json.JSONDecodeError):
+                pass
+        if any(value and secrets.compare_digest(value, source_hash) for value in candidate_hashes):
+            matches.append(run)
+    return matches
+
+
+def _find_recipient_batches(recipient_set_hash, exclude=None):
+    RUNS_DIR.mkdir(exist_ok=True)
+    matches = []
+    for run in RUNS_DIR.glob("mailpilot_*"):
+        if exclude and run == exclude:
+            continue
+        candidate = ""
+        sidecar = run / "recipients.sha256"
+        if sidecar.exists():
+            try:
+                candidate = sidecar.read_text(encoding="ascii").strip()
+            except OSError:
+                candidate = ""
+        if not candidate:
+            try:
+                manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+                candidate = str(manifest.get("recipient_set_hash", ""))
+            except (OSError, json.JSONDecodeError):
+                candidate = ""
+        if not candidate and (run / "sendable.csv").exists():
+            try:
+                candidate = _recipient_set_hash(_read_sendable(run / "sendable.csv"))
+            except (OSError, KeyError):
+                candidate = ""
+        if candidate and secrets.compare_digest(candidate, recipient_set_hash):
+            matches.append(run)
+    return matches
+
+
+def _run_recipient_hashes(run):
+    run = Path(run)
+    index = run / "recipient-index.json"
+    if index.exists():
+        try:
+            values = json.loads(index.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise mailer.LedgerIntegrityError(
+                f"Recipient identity index is damaged for {run.name}."
+            ) from e
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise mailer.LedgerIntegrityError(
+                f"Recipient identity index is invalid for {run.name}."
+            )
+        return set(values)
+    sendable = run / "sendable.csv"
+    if sendable.exists():
+        try:
+            return set(_recipient_hashes(_read_sendable(sendable)))
+        except (OSError, KeyError) as e:
+            raise mailer.LedgerIntegrityError(
+                f"Recipient identities cannot be read for {run.name}."
+            ) from e
+    raise mailer.LedgerIntegrityError(
+        f"A started batch ({run.name}) has no recoverable recipient identity index."
+    )
+
+
+def _find_overlapping_started_batch(df, exclude=None):
+    current = set(_recipient_hashes(df))
+    for run in RUNS_DIR.glob("mailpilot_*"):
+        if exclude and run == exclude:
+            continue
+        if _production_started(run) and current.intersection(_run_recipient_hashes(run)):
+            return run
+    return None
+
+
+def _production_started(run):
+    sendable = Path(run) / "sendable.csv"
+    ledger = Path(mailer._default_ledger_path(str(sendable)))
+    anchor = Path(mailer._ledger_anchor_path(str(ledger)))
+    if ledger.exists() or anchor.exists() or (Path(run) / "production.started").exists():
+        return True
+    try:
+        manifest = json.loads((Path(run) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return manifest.get("production_started") is True
+
+
+def _find_existing_preview(batch_fingerprint, exclude=None):
     RUNS_DIR.mkdir(exist_ok=True)
     for run in RUNS_DIR.glob("mailpilot_*"):
         if exclude and run == exclude:
             continue
         manifest = run / "manifest.json"
-        if not manifest.exists() or not (run / "sendable.csv").exists():
+        if not manifest.exists():
             continue
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
+            candidate = str(data.get("batch_fingerprint", ""))
         except (OSError, json.JSONDecodeError):
             continue
-        if secrets.compare_digest(str(data.get("source_hash", "")), source_hash):
+        if candidate and secrets.compare_digest(candidate, batch_fingerprint):
             return run
     return None
 
@@ -754,7 +1025,13 @@ def resume_run(run_name):
         return redirect(url_for("index"))
     sendable_path = run_dir / "sendable.csv"
     if not sendable_path.exists():
-        return redirect(url_for("index"))
+        return _render(
+            message=(
+                "Recovery blocked: this batch manifest exists but sendable.csv is missing. "
+                "Do not create a replacement batch until the original sending history is reconciled."
+            ),
+            message_kind="error",
+        )
     try:
         df = _read_sendable(sendable_path)
         mailer._apply_ledger(df, mailer._default_ledger_path(str(sendable_path)))
@@ -802,17 +1079,6 @@ def preview():
     suffix = Path(uploaded.filename).suffix.lower() or ".csv"
     if suffix not in (".csv", ".xlsx"):
         return _render(message="Only CSV and XLSX files are accepted.", message_kind="error")
-    RUNS_DIR.mkdir(exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix="mailpilot_", dir=RUNS_DIR))
-    source_path = run_dir / f"recipients{suffix}"
-    uploaded.save(source_path)
-    source_hash = _sha256_path(source_path)
-    existing = _find_existing_batch(source_hash, exclude=run_dir)
-    if existing:
-        shutil.rmtree(run_dir)
-        return redirect(url_for("resume_run", run_name=existing.name))
-    out_path = run_dir / "sendable.csv"
-
     mode = request.form.get("mode")
     group_col = request.form.get("group_col", "").strip() or None
     if mode == "simple":
@@ -830,6 +1096,16 @@ def preview():
             message_kind="error",
         )
 
+    RUNS_DIR.mkdir(exist_ok=True)
+    mailer._fsync_parent(RUNS_DIR)
+    run_dir = Path(tempfile.mkdtemp(prefix="mailpilot_", dir=RUNS_DIR))
+    mailer._fsync_parent(run_dir)
+    source_path = run_dir / f"recipients{suffix}"
+    uploaded.save(source_path)
+    source_hash = _sha256_path(source_path)
+    _write_hash_sidecar(run_dir, "source.sha256", source_hash)
+    out_path = run_dir / "sendable.csv"
+
     args = Namespace(
         file=str(source_path),
         template=request.form.get("template") or "default",
@@ -841,19 +1117,77 @@ def preview():
     )
     ok, output = _capture(mailer.cmd_preview, args)
     df = _read_sendable(out_path)
-    if ok:
-        (run_dir / "preview.txt").write_text(output, encoding="utf-8")
-        _write_manifest(
-            run_dir,
-            original_filename=uploaded.filename,
-            source_hash=source_hash,
-            content_hash=_content_hash(df),
-            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+    if not ok:
+        _remove_run(run_dir)
+        return _render(
+            message="Preview failed. The uploaded recipient copy was deleted.",
+            message_kind="error",
+            preview_output=output,
         )
-    action_token = _new_action_token(run_dir) if ok else ""
+
+    batch_fingerprint = _batch_fingerprint(df)
+    recipient_set_hash = _recipient_set_hash(df)
+    try:
+        with mailer.BatchLock(str(RUNS_DIR / ".preview-dedupe.lock"), blocking=True):
+            existing = _find_existing_preview(batch_fingerprint, exclude=run_dir)
+            if existing:
+                _remove_run(run_dir)
+                return redirect(url_for("resume_run", run_name=existing.name))
+            same_sources = _find_source_batches(source_hash, exclude=run_dir)
+            equivalent_recipients = _find_recipient_batches(
+                recipient_set_hash, exclude=run_dir
+            )
+            overlapping_started = _find_overlapping_started_batch(df, exclude=run_dir)
+            if overlapping_started:
+                _remove_run(run_dir)
+                return redirect(
+                    url_for("resume_run", run_name=overlapping_started.name)
+                )
+            for prior_run in set(same_sources + equivalent_recipients):
+                if _production_started(prior_run):
+                    _remove_run(run_dir)
+                    return redirect(url_for("resume_run", run_name=prior_run.name))
+            for same_source in same_sources:
+                try:
+                    old_manifest = json.loads(
+                        (same_source / "manifest.json").read_text(encoding="utf-8")
+                    )
+                    old_fingerprint = str(old_manifest.get("batch_fingerprint", ""))
+                except (OSError, json.JSONDecodeError):
+                    old_fingerprint = ""
+                if not old_fingerprint or not (same_source / "sendable.csv").exists():
+                    _remove_run(run_dir)
+                    return redirect(url_for("resume_run", run_name=same_source.name))
+            for same_source in same_sources:
+                _remove_run(same_source)
+            _write_hash_sidecar(run_dir, "recipients.sha256", recipient_set_hash)
+            _write_recipient_index(run_dir, df)
+            (run_dir / "preview.txt").write_text(output, encoding="utf-8")
+            _write_manifest(
+                run_dir,
+                original_filename=uploaded.filename,
+                source_hash=source_hash,
+                content_hash=_content_hash(df),
+                batch_fingerprint=batch_fingerprint,
+                recipient_set_hash=recipient_set_hash,
+                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+    except mailer.BatchAlreadyLocked:
+        _remove_run(run_dir)
+        return _render(
+            message="Another preview is being finalized. Please retry after it finishes.",
+            message_kind="error",
+        )
+    except (OSError, mailer.LedgerIntegrityError) as e:
+        _remove_run(run_dir)
+        return _render(
+            message=f"Preview finalization was blocked for safety: {e}",
+            message_kind="error",
+        )
+    action_token = _new_action_token(run_dir)
     return _render(
-        message="Preview completed. Nothing has been sent." if ok else "Preview failed.",
-        message_kind="success" if ok else "error",
+        message="Preview completed. Nothing has been sent.",
+        message_kind="success",
         preview_output=output,
         sendable_path=str(out_path),
         run_dir=str(run_dir),
@@ -893,6 +1227,13 @@ def send():
             table_html=_table_html(df),
         )
 
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return render_error("Batch manifest is missing or damaged. Real/test sending is blocked.")
+    if not secrets.compare_digest(str(manifest.get("content_hash", "")), _content_hash(df)):
+        return render_error("The reviewed recipients or message content changed. Run preview again.")
+
     if action not in ("dry", "test", "send"):
         return render_error("Unknown action. Nothing was sent.")
     try:
@@ -905,6 +1246,27 @@ def send():
     redirect_to = request.form.get("redirect_to", "").strip() or None
     if action == "test" and not redirect_to:
         return render_error("A redirected test inbox is required. Test mode can never use customer addresses.")
+    test_templates = []
+    if action == "test":
+        normalized_redirect = (mailer._valid_email(redirect_to) or "").lower()
+        allowed_test_inboxes = {
+            str(request.form.get("user", "")).strip().lower(),
+            str(request.form.get("from_addr", "")).strip().lower(),
+        }
+        customer_inboxes = set(df["email"].astype(str).str.strip().str.lower())
+        if not normalized_redirect or normalized_redirect not in allowed_test_inboxes:
+            return render_error(
+                "For safety, the test inbox must exactly match the SMTP account or From address."
+            )
+        if normalized_redirect in customer_inboxes:
+            return render_error(
+                "The test inbox is also present in the customer list. Remove it from the list or use a separate sender test inbox."
+            )
+        test_templates = _pending_templates(df)
+        if not test_templates:
+            return render_error("There are no pending templates to test.")
+        if len(test_templates) > 20:
+            return render_error("More than 20 templates require review. Split or simplify this batch first.")
     if action == "send":
         if metrics["blocked"]:
             return render_error(
@@ -917,8 +1279,20 @@ def send():
         expected_phrase = f"发送 {limit} 封"
         if request.form.get("confirm_phrase", "").strip() != expected_phrase:
             return render_error(f"Type exactly “{expected_phrase}” to authorize this real batch.")
-        marker = run_dir / "redirect-test-passed.txt"
-        if not marker.exists() or marker.read_text(encoding="utf-8").strip() != _content_hash(df):
+        marker = _read_test_marker(run_dir)
+        pending_templates = set(_pending_templates(df))
+        try:
+            marker_matches = (
+                marker
+                and secrets.compare_digest(
+                    str(marker.get("content_hash", "")), _content_hash(df)
+                )
+                and pending_templates.issubset(set(marker.get("templates", [])))
+                and marker.get("smtp_identity") == _smtp_identity(request.form)
+            )
+        except (TypeError, ValueError):
+            marker_matches = False
+        if not marker_matches:
             return render_error("Run a successful redirected test for this exact preview before real sending.")
 
     try:
@@ -928,40 +1302,115 @@ def send():
     if action == "send" and sleep_seconds < 1:
         return render_error("Real sending requires at least 1 second between emails.")
 
-    config_path = None
+    config_data = None
     if action != "dry":
         try:
-            config_path = _write_config(run_dir, request.form)
-        except (OSError, TypeError, ValueError) as e:
+            config_data = _config_from_form(request.form)
+        except (OSError, TypeError, ValueError, SystemExit) as e:
             return render_error(f"SMTP settings are invalid: {e}")
-    args = Namespace(
-        input=str(sendable_path),
-        config=str(config_path) if config_path else "",
-        only=request.form.get("only") or None,
-        redirect_to=redirect_to if action == "test" else None,
-        limit=limit,
-        sleep=sleep_seconds,
-        at=None,
-        dry_run=action == "dry",
-        ledger=None,
-    )
+
+    if action == "send":
+        try:
+            with mailer.BatchLock(
+                str(RUNS_DIR / ".preview-dedupe.lock"), blocking=True
+            ):
+                if not run_dir.exists() or not sendable_path.exists():
+                    return _render(
+                        message=(
+                            "This preview was replaced before sending began. Nothing was sent; "
+                            "open the current batch and review it again."
+                        ),
+                        message_kind="error",
+                    )
+                locked_df = _read_sendable(sendable_path)
+                mailer._validate_reviewed_batch(locked_df)
+                locked_manifest = json.loads(
+                    (run_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                if not secrets.compare_digest(
+                    str(locked_manifest.get("content_hash", "")),
+                    _content_hash(locked_df),
+                ):
+                    raise mailer.LedgerIntegrityError(
+                        "The reviewed batch changed before production could start."
+                    )
+                overlapping = _find_overlapping_started_batch(
+                    locked_df, exclude=run_dir
+                )
+                if overlapping:
+                    return render_error(
+                        "Real sending is blocked because recipients overlap with already-started "
+                        f"batch {overlapping.name}. Reopen and reconcile that batch first."
+                    )
+                _ensure_production_marker(run_dir, locked_df)
+                _write_manifest(
+                    run_dir,
+                    production_started=True,
+                    production_started_at=datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                )
+                df = locked_df
+        except (
+            OSError,
+            json.JSONDecodeError,
+            mailer.BatchAlreadyLocked,
+            mailer.LedgerIntegrityError,
+        ) as e:
+            return render_error(f"Production start was blocked for safety: {e}")
+
     try:
         test_ledger = Path(mailer._default_test_ledger_path(str(sendable_path)))
         before_test_events = list(mailer._iter_ledger(str(test_ledger)) or [])
-        ok, output = _capture(mailer.cmd_send, args)
-        if action == "test" and ok:
+        if action == "test":
+            outputs = []
+            ok = True
+            for template_name in test_templates:
+                args = Namespace(
+                    input=str(sendable_path),
+                    config="",
+                    config_data=config_data,
+                    only=template_name,
+                    redirect_to=redirect_to,
+                    limit=1,
+                    sleep=0,
+                    at=None,
+                    dry_run=False,
+                    ledger=None,
+                )
+                run_ok, run_output = _capture(mailer.cmd_send, args)
+                outputs.append(f"=== Template: {template_name} ===\n{run_output}")
+                ok = ok and run_ok
+            output = "\n\n".join(outputs)
             after_test_events = list(mailer._iter_ledger(str(test_ledger)) or [])
             new_events = after_test_events[len(before_test_events):]
-            if any(event.get("status") == "test_sent" for event in new_events):
-                (run_dir / "redirect-test-passed.txt").write_text(
-                    _content_hash(df), encoding="utf-8"
-                )
+            accepted_templates = {
+                str(event.get("template", ""))
+                for event in new_events
+                if event.get("status") == "test_sent"
+            }
+            if ok and accepted_templates == set(test_templates):
+                _write_test_marker(run_dir, df, test_templates, request.form)
             else:
                 ok = False
-                output = f"{output}\nNo redirected test was accepted by SMTP.".strip()
-    finally:
-        if config_path:
-            config_path.unlink(missing_ok=True)
+                missing = sorted(set(test_templates).difference(accepted_templates))
+                output = f"{output}\nTemplates without an accepted redirected test: {missing}".strip()
+        else:
+            args = Namespace(
+                input=str(sendable_path),
+                config="",
+                config_data=config_data,
+                only=request.form.get("only") or None,
+                redirect_to=None,
+                limit=limit,
+                sleep=sleep_seconds,
+                at=None,
+                dry_run=action == "dry",
+                ledger=None,
+            )
+            ok, output = _capture(mailer.cmd_send, args)
+    except mailer.LedgerIntegrityError as e:
+        ok, output = False, f"Test ledger integrity error: {e}"
 
     df = _read_sendable(str(sendable_path))
     command_has_errors = "unknown" in output.lower() or "✗" in output

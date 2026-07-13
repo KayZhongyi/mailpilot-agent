@@ -6,6 +6,10 @@ sendable.csv
 *_send.csv
 *.out.csv
 *.sendlog.jsonl
+*.testlog.jsonl
+*.sendlog.jsonl.started
+*.testlog.jsonl.started
+*.lock
 *.tmp
 .mailpilot_runs/
 

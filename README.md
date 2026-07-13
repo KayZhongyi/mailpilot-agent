@@ -15,7 +15,8 @@ It is designed for careful workflows like pre-sales follow-ups, event notificati
 - **Preview before sending**: see per-group counts, rendered samples, and unsafe rows before any email goes out.
 - **Fail-closed resume**: writes `attempting` before SMTP and the result afterward. An interrupted,
   uncertain attempt becomes `unknown` and is never retried automatically.
-- **Safe testing**: use `--dry-run`, `--redirect-to`, and `--limit` before real sending.
+- **Safe testing**: redirected tests can only go to the SMTP/From address, never to an address in the customer list.
+- **Duplicate-batch guard**: once production starts, a new batch that overlaps any of its recipients is blocked and reopens the original batch instead of creating a second send ledger.
 - **Schedule and throttle**: send later with `--at`, or slow down batches with `--sleep`.
 - **Bounce reconciliation**: scan bounce notifications through IMAP and mark undelivered rows.
 - **Local-first**: no SaaS account, no telemetry, no database required.
@@ -62,8 +63,15 @@ The UI lets you:
 
 No AI software is required for the web UI. Everything runs locally on your computer.
 
-After a restart, use **Resume an existing batch**. Uploading the exact same source file again opens
-the original batch instead of creating a second send ledger.
+After a restart, use **Resume an existing batch**. Once production has started, uploading the same
+source—or any new list that overlaps its recipients—opens the original batch instead of creating a
+second send ledger. Reconcile the old batch before beginning a separate campaign. Never delete or rename the hidden run directory, ledger, or
+`.started` marker while a batch is active.
+
+For a 1000+ recipient job, do not authorize all rows at once. Verify the trusted historical sent
+column, preview the whole file, test every template to the sender inbox, then send in web batches of
+at most 100 (CLI: 200) with at least one second between attempts. Reopen the same batch after every
+interruption.
 
 ## Safety Demo
 
@@ -120,10 +128,11 @@ Preview a simple one-template list:
 python scripts/mailer.py preview samples/attendees.csv --template default --out sendable.csv
 ```
 
-Test before sending:
+Test before sending. The redirect must equal the SMTP user or From address and must not also appear
+in the customer list:
 
 ```bash
-python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to you@example.com --limit 3
+python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to sender@example.com --limit 3
 ```
 
 Redirected tests use a separate test ledger and never mark customer rows as sent.
@@ -180,6 +189,10 @@ If the process stops halfway through, run the same command again. MailPilot repl
 and skips rows already accepted by SMTP. If a process stopped after an attempt began but before a
 definite SMTP result was recorded, that row becomes `unknown` and requires manual reconciliation;
 MailPilot will not risk sending it twice automatically.
+
+The status imported during preview is also sealed as immutable history. Clearing a current `status`
+cell later cannot turn a historically sent, bounced, suppressed, or uncertain row back into a
+sendable row.
 
 The CSV is still updated for convenience, but it is written atomically instead of being rewritten after every single email.
 
@@ -250,7 +263,7 @@ python scripts/mailer.py send --input sendable.csv --config config.yaml --dry-ru
 Redirect all emails to yourself for testing:
 
 ```bash
-python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to you@example.com --limit 3
+python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to sender@example.com --limit 3
 ```
 
 Send only one group:
