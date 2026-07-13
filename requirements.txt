@@ -3,4 +3,4 @@ openpyxl
 jinja2
 pyyaml
 certifi
-flask
+flask>=3.1,<4

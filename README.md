@@ -17,8 +17,8 @@ It is designed for careful workflows like pre-sales follow-ups, event notificati
   uncertain attempt becomes `unknown` and is never retried automatically.
 - **Safe testing**: redirected tests can only go to the SMTP/From address, never to an address in the customer list.
 - **Duplicate-batch guard in the local web UI**: once production starts, an overlapping upload reopens the original batch instead of creating a second send ledger.
-- **Schedule and throttle**: send later with `--at`, or slow down batches with `--sleep`.
-- **Bounce reconciliation**: bind IMAP to the recorded production sender, scan from the activity start date, record UID coverage, and automatically apply only DSNs with the exact activity Message-ID.
+- **Schedule, throttle, and rotate connections**: send later with `--at`, slow down with `--sleep`, and proactively reconnect after a configurable number of SMTP attempts.
+- **Evidence-bound bounce reconciliation**: parse structured DSNs, require `Action=failed`, a valid enhanced status, the recorded production sender, and the exact activity Message-ID. Delayed, malformed, and address-only notices remain manual-review items.
 - **Explicit web activity lifecycle**: production open → resolve uncertainty → close outbound → scan/apply bounces → archive.
 - **Auditable web campaigns**: overlapping recipients stay blocked until the old activity is archived and a one-time new-activity authorization is created.
 - **Local-first**: no SaaS account, no telemetry, no database required.
@@ -69,6 +69,17 @@ The UI lets you:
 
 No AI software is required for the web UI. Everything runs locally on your computer.
 
+All web activity state lives in the hidden `.mailpilot_runs` directory inside this project folder.
+Before upgrading, unzipping a replacement, moving the project, or changing computers, quit
+MailPilot and copy the **entire** `.mailpilot_runs` directory into the replacement project. Never
+run the old and new copies at the same time. Copying only the original spreadsheet loses the
+checkpoint, duplicate-campaign, bounce, and suppression evidence required for safe resume.
+
+Never commit real recipient files or credentials. `.gitignore` blocks ordinary `*.csv`, Excel
+files, `config*.yaml`, `.env*`, ledgers, and `.mailpilot_runs` by default; only public sample CSVs
+under `samples/` are allowed. Keep customer data outside the repository and check `git status`
+before every commit.
+
 After a restart, use **Resume an existing batch**. Once production has started, uploading the same
 source—or any new list that overlaps its recipients—opens the original batch instead of creating a
 second send ledger. Reconcile the old batch before beginning a separate campaign. Never delete or rename the hidden run directory, ledger, or
@@ -79,12 +90,29 @@ column, preview the whole file, test every template to the sender inbox, then se
 at most 100 (CLI: 200) with at least one second between attempts. Reopen the same batch after every
 interruption.
 
+MailPilot cannot see messages sent elsewhere from the same mailbox or reserve provider quota.
+Check the current account/tenant limit before production. A personal Gmail account can be blocked
+after more than 500 messages in one day, so it cannot safely complete a 1000-recipient job in one
+day. Google Workspace and Exchange Online have separate daily/rate limits; Exchange Online also
+documents 30 messages per minute and recommends specialist providers for legitimate bulk email.
+For 1000+ external or marketing mail, prefer a provider configured with SPF, DKIM, DMARC, bounce
+events, and a real unsubscribe/suppression workflow. See
+[`references/email_provider_setup.md`](references/email_provider_setup.md).
+
 If any attempt becomes `unknown`, MailPilot pauses the entire production batch. Check the provider
 logs, then record either “confirmed accepted” or “permanently do not retry” with an evidence note.
 Do not guess. After the last outbound decision, close outbound, scan bounces, apply only DSNs whose
 Message-ID matches this activity, acknowledge any unverified candidates, and archive the activity.
 The scan report shows every candidate and records the IMAP UID range. If the configured scan cap did
 not cover every message since the activity began, archiving is blocked.
+
+The IMAP scanner reads `INBOX` only. Check Spam/Junk and move or route delivery notifications into
+`INBOX` before the final scan. SMTP and IMAP may use different app passwords, but the web workflow
+requires the IMAP login identity to equal the production SMTP user or `from_addr`. MailPilot v0.2 does not
+support IMAP OAuth; Exchange Online password IMAP is therefore blocked, so use a compatible bounce
+mailbox. A provider event export alone cannot satisfy v0.2's auditable archive gate because event
+import is not implemented yet. To avoid a stranded activity, the local web UI permits Microsoft
+365 redirected tests but blocks Microsoft 365 production sending.
 
 Do not archive immediately after the last send. Wait for the bounce window recommended by your mail
 provider (commonly at least 24–72 hours), scan again, then archive. An archive is immutable; the
@@ -244,7 +272,15 @@ new campaign, open the archive, choose **Start a new activity**, type the exact 
 then upload the new list within 30 minutes. A new Activity ID gives the campaign a separate
 Message-ID namespace. Addresses previously marked `bounced` or `unsubscribed` remain blocked.
 
-The CSV is still updated for convenience, but it is written atomically instead of being rewritten after every single email.
+Only address-invalid DSNs such as `5.1.1` enter cross-activity hard-bounce suppression. Other
+message-level failures, including policy/authentication failures such as `5.7.1` and temporary
+`4.x` failures, stop the current activity as `soft_bounced` but do not permanently blacklist the
+recipient for a later corrected campaign.
+
+The CSV is still updated for convenience, but it is written atomically instead of being rewritten
+after every single email. Use the web UI's **Download full status CSV** for spreadsheet viewing; it
+neutralizes formula-like cells. Treat the internal `sendable.csv` as machine state and do not edit
+it in Excel.
 
 ## List Format
 
@@ -354,10 +390,18 @@ smtp:
   use_ssl: true
   user: you@example.com
   password: YOUR_APP_PASSWORD_HERE
+  max_messages_per_connection: 50
 
 from_addr: you@example.com
 from_name: Your Name
 unsubscribe: you@example.com
+
+# Optional; the web workflow requires user to match SMTP user or from_addr.
+# imap:
+#   host: imap.gmail.com
+#   port: 993
+#   user: you@example.com
+#   password: YOUR_IMAP_APP_PASSWORD_HERE
 ```
 
 Use an **app password**, not your normal email password. See:
@@ -372,13 +416,20 @@ references/email_provider_setup.md
 
 For larger or recurring batches, use a transactional provider such as Amazon SES, SendGrid, Mailgun, or Aliyun DirectMail with SPF/DKIM/DMARC configured.
 
+The `unsubscribe` setting adds a basic `List-Unsubscribe` contact header only. v0.2 does **not**
+implement RFC 8058 one-click unsubscribe, a hosted unsubscribe endpoint, or a UI for registering
+late opt-out requests into a global suppression list. Do not claim bulk-sender compliance from this
+header alone. For marketing mail, use a compliant provider/workflow and maintain consent and
+suppression upstream; MailPilot is safest for expected transactional/status notifications.
+
 MailPilot is designed for responsible workflows:
 
 - send only to recipients who expect the message
 - preview before sending
 - throttle larger batches
-- keep unsubscribed or bounced addresses out of future lists
-- include a working unsubscribe contact
+- import a reviewed consent/suppression decision before preview
+- keep archived hard-bounced addresses out of future activities
+- provide a working unsubscribe contact and process requests outside v0.2
 
 ## Project Structure
 
@@ -424,6 +475,8 @@ downloads anything; the suite uses Fake SMTP and Fake IMAP only and never logs i
 - The launchers create a project-local `.venv`; they do not install packages into the global Python.
 - First launch needs internet to install dependencies. Later launches reuse the local environment.
 - Keep the terminal window open while using MailPilot.
+- Before replacing/upgrading the folder, quit the app and back up/copy the whole
+  `.mailpilot_runs` directory. Never operate two copies against the same activity.
 - The app binds `127.0.0.1:8501` before opening the browser, preventing the former
   `ERR_CONNECTION_REFUSED` startup race.
 - If port 8501 is occupied, close the older MailPilot terminal and retry.
@@ -439,7 +492,8 @@ downloads anything; the suite uses Fake SMTP and Fake IMAP only and never logs i
 - Attachments
 - SQLite checkpoint ledger option
 - SendGrid / SES / Mailgun adapters
-- Better DSN bounce parsing
+- OAuth / provider-event bounce adapters and late-event reconciliation
+- RFC 8058 one-click unsubscribe and a durable global suppression workflow
 - Richer preview reports
 
 ## License

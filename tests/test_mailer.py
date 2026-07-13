@@ -118,6 +118,7 @@ def _web_send_form(run_dir, sendable, token, **overrides):
         "sleep": "1",
         "confirm_real_send": "on",
         "confirm_test_received": "on",
+        "confirm_provider_quota": "on",
         "confirm_phrase": "发送 1 封",
     }
     values.update(overrides)
@@ -125,8 +126,18 @@ def _web_send_form(run_dir, sendable, token, **overrides):
 
 
 def _fake_bounce_extraction(bounces, complete=True, matching_messages=12):
+    normalized = {}
+    for address, value in bounces.items():
+        item = dict(value)
+        item.setdefault("verified_failure", True)
+        item.setdefault("action", "failed")
+        item.setdefault("status", "5.1.1")
+        item.setdefault("bounce_class", "hard")
+        normalized[address] = item
     return {
-        "bounces": bounces,
+        "bounces": normalized,
+        "unverified_candidates": [],
+        "non_permanent": [],
         "coverage": {
             "mailbox": "INBOX",
             "uidvalidity": "test-uidvalidity-1",
@@ -138,6 +149,93 @@ def _fake_bounce_extraction(bounces, complete=True, matching_messages=12):
             "complete": complete,
         },
     }
+
+
+def _dsn_message(
+    *,
+    action="failed",
+    status="5.1.1",
+    recipient="bad@example.com",
+    message_id="<mailpilot.test@example.com>",
+):
+    action_line = f"Action: {action}\r\n" if action is not None else ""
+    status_line = f"Status: {status}\r\n" if status is not None else ""
+    return (
+        "From: Mail Delivery Subsystem <mailer-daemon@example.net>\r\n"
+        "Subject: Delivery Status Notification\r\n"
+        "MIME-Version: 1.0\r\n"
+        'Content-Type: multipart/report; report-type=delivery-status; boundary="dsn"\r\n'
+        "\r\n"
+        "--dsn\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "Delivery report.\r\n"
+        "--dsn\r\n"
+        "Content-Type: message/delivery-status\r\n\r\n"
+        "Reporting-MTA: dns; mx.example.net\r\n\r\n"
+        f"Final-Recipient: rfc822; {recipient}\r\n"
+        f"{action_line}"
+        f"{status_line}"
+        f"Diagnostic-Code: smtp; {status or 'unknown'} simulated response\r\n"
+        "\r\n"
+        "--dsn\r\n"
+        "Content-Type: message/rfc822\r\n\r\n"
+        "From: sender@example.com\r\n"
+        f"To: {recipient}\r\n"
+        f"Message-ID: {message_id}\r\n"
+        "Subject: Original message\r\n\r\n"
+        "Body\r\n"
+        "--dsn--\r\n"
+    ).encode("utf-8")
+
+
+def _trusted_sent_batch(tmp_path, address="bad@example.com"):
+    sendable = tmp_path / "sendable.csv"
+    sendable.write_text(
+        "email,template,subject,body,status,sendable,reason\n"
+        f"{address},default,Hi,Body,,yes,\n",
+        encoding="utf-8",
+    )
+    _seal_sendable(sendable)
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    ledger = mailer._default_ledger_path(str(sendable))
+    mailer._ensure_ledger_anchor(ledger, str(rows.loc[0, "batch_id"]))
+    mailer._append_ledger(
+        ledger,
+        {
+            "event": "send_result",
+            "row": 0,
+            "batch_id": str(rows.loc[0, "batch_id"]),
+            "record_id": str(rows.loc[0, "record_id"]),
+            "email": address,
+            "status": "sent",
+            "send_time": "2026-07-13T12:00:00+08:00",
+        },
+    )
+    expected_message_id = mailer._send_message_id(
+        str(rows.loc[0, "record_id"]), "sender@example.com"
+    )
+    args = Namespace(
+        input=str(sendable),
+        config="",
+        config_data={
+            "smtp": {
+                "host": "smtp.example.com",
+                "user": "smtp-user@example.com",
+                "password": "smtp-password",
+            },
+            "imap": {
+                "host": "imap.example.com",
+                "port": 993,
+                "user": "bounce-reader@example.com",
+                "password": "imap-password",
+            },
+            "from_addr": "sender@example.com",
+        },
+        ledger=None,
+        lookback=50,
+        apply=False,
+    )
+    return sendable, rows, expected_message_id, args
 
 
 def test_column_detection_supports_chinese_headers():
@@ -2150,7 +2248,11 @@ def test_web_close_bounce_apply_and_archive_lifecycle(tmp_path):
 
 def test_new_activity_suppression_unions_every_overlapping_archive(tmp_path):
     archived_runs = []
-    for number, status in ((0, "bounced"), (1, "unsubscribed")):
+    for number, status in (
+        (0, "bounced"),
+        (1, "unsubscribed"),
+        (2, "soft_bounced"),
+    ):
         run = tmp_path / f"mailpilot_archive_{number}"
         run.mkdir()
         sendable = run / "sendable.csv"
@@ -2166,6 +2268,7 @@ def test_new_activity_suppression_unions_every_overlapping_archive(tmp_path):
         [
             {"email": "user0@example.com", "sendable": "yes", "reason": ""},
             {"email": "user1@example.com", "sendable": "yes", "reason": ""},
+            {"email": "user2@example.com", "sendable": "yes", "reason": ""},
             {"email": "safe@example.com", "sendable": "yes", "reason": ""},
         ]
     )
@@ -2179,7 +2282,7 @@ def test_new_activity_suppression_unions_every_overlapping_archive(tmp_path):
         web_app._archive_receipt = original_receipt
 
     assert count == 2
-    assert list(suppressed["sendable"]) == ["no", "no", "yes"]
+    assert list(suppressed["sendable"]) == ["no", "no", "yes", "yes"]
 
 
 def test_main_binds_local_server_before_opening_browser():
@@ -2472,3 +2575,637 @@ def test_web_damaged_matching_source_blocks_new_batch(tmp_path):
     assert response.status_code == 200
     assert "sendable.csv 缺失".encode() in response.data
     assert list(tmp_path.glob("mailpilot_*")) == [broken]
+
+
+def test_smtp_connection_rotation_preserves_every_checkpoint(tmp_path):
+    sendable = tmp_path / "sendable.csv"
+    config = tmp_path / "config.yaml"
+    sendable.write_text(
+        "email,template,subject,body,status,sendable\n"
+        "a@example.com,default,Hi,Body,,yes\n"
+        "b@example.com,default,Hi,Body,,yes\n"
+        "c@example.com,default,Hi,Body,,yes\n",
+        encoding="utf-8",
+    )
+    _seal_sendable(sendable)
+    config.write_text(
+        "smtp:\n"
+        "  host: smtp.example.com\n"
+        "  port: 465\n"
+        "  use_ssl: true\n"
+        "  user: sender@example.com\n"
+        "  password: app-password\n"
+        "  max_messages_per_connection: 2\n"
+        "from_addr: sender@example.com\n",
+        encoding="utf-8",
+    )
+
+    class FakeSMTP:
+        def __init__(self):
+            self.messages = []
+            self.quit_called = False
+
+        def sendmail(self, _from, _recipients, message):
+            self.messages.append(message)
+            return {}
+
+        def quit(self):
+            self.quit_called = True
+
+    servers = []
+
+    def connect(_cfg):
+        server = FakeSMTP()
+        servers.append(server)
+        return server
+
+    original_connect = mailer.connect_smtp
+    original_sleep = mailer.time.sleep
+    try:
+        mailer.connect_smtp = connect
+        mailer.time.sleep = lambda _seconds: None
+        mailer.cmd_send(_send_args(sendable, config, limit=3, sleep=1))
+    finally:
+        mailer.connect_smtp = original_connect
+        mailer.time.sleep = original_sleep
+
+    assert [len(server.messages) for server in servers] == [2, 1]
+    assert all(server.quit_called for server in servers)
+    events = list(mailer._iter_ledger(mailer._default_ledger_path(str(sendable))))
+    assert sum(event.get("status") == "attempting" for event in events) == 3
+    assert sum(event.get("status") == "sent" for event in events) == 3
+    assert list(pd.read_csv(sendable)["status"]) == ["sent", "sent", "sent"]
+
+
+def test_smtp_reconnect_failure_never_creates_a_phantom_attempt(tmp_path):
+    sendable = tmp_path / "sendable.csv"
+    config = tmp_path / "config.yaml"
+    sendable.write_text(
+        "email,template,subject,body,status,sendable\n"
+        "a@example.com,default,Hi,Body,,yes\n"
+        "b@example.com,default,Hi,Body,,yes\n",
+        encoding="utf-8",
+    )
+    _seal_sendable(sendable)
+    config.write_text(
+        "smtp:\n"
+        "  host: smtp.example.com\n"
+        "  user: sender@example.com\n"
+        "  password: app-password\n"
+        "  max_messages_per_connection: 1\n"
+        "from_addr: sender@example.com\n",
+        encoding="utf-8",
+    )
+
+    class FirstSMTP:
+        def sendmail(self, _from, _recipients, _message):
+            return {}
+
+        def quit(self):
+            pass
+
+    calls = 0
+
+    def connect(_cfg):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated reconnect failure")
+        return FirstSMTP()
+
+    original_connect = mailer.connect_smtp
+    original_sleep = mailer.time.sleep
+    try:
+        mailer.connect_smtp = connect
+        mailer.time.sleep = lambda _seconds: None
+        with pytest.raises(OSError, match="reconnect failure"):
+            mailer.cmd_send(_send_args(sendable, config, limit=2, sleep=1))
+    finally:
+        mailer.connect_smtp = original_connect
+        mailer.time.sleep = original_sleep
+
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    assert list(rows["status"]) == ["sent", ""]
+    events = list(mailer._iter_ledger(mailer._default_ledger_path(str(sendable))))
+    assert [event.get("row") for event in events if event.get("status") == "attempting"] == [0]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_calls"),
+    [
+        (smtplib.SMTPDataError(421, b"temporary rate limit"), 1),
+        (smtplib.SMTPSenderRefused(550, b"sender rejected", "sender@example.com"), 1),
+        (smtplib.SMTPDataError(550, b"same content rejected"), 3),
+    ],
+)
+def test_smtp_circuit_breakers_stop_likely_batch_wide_failures(
+    tmp_path, error, expected_calls
+):
+    sendable = tmp_path / "sendable.csv"
+    config = tmp_path / "config.yaml"
+    sendable.write_text(
+        "email,template,subject,body,status,sendable\n"
+        + "".join(
+            f"user{i}@example.com,default,Hi,Body,,yes\n" for i in range(4)
+        ),
+        encoding="utf-8",
+    )
+    _seal_sendable(sendable)
+    _write_config(config)
+
+    class RejectingSMTP:
+        calls = 0
+
+        def sendmail(self, _from, _recipients, _message):
+            self.calls += 1
+            raise error
+
+        def quit(self):
+            pass
+
+    server = RejectingSMTP()
+    original_connect = mailer.connect_smtp
+    original_sleep = mailer.time.sleep
+    try:
+        mailer.connect_smtp = lambda _cfg: server
+        mailer.time.sleep = lambda _seconds: None
+        mailer.cmd_send(_send_args(sendable, config, limit=4, sleep=1))
+    finally:
+        mailer.connect_smtp = original_connect
+        mailer.time.sleep = original_sleep
+
+    assert server.calls == expected_calls
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    assert list(rows["status"]) == ["error"] * expected_calls + [""] * (
+        4 - expected_calls
+    )
+
+
+def test_redirect_message_ids_are_unique_and_never_equal_production_id(tmp_path):
+    sendable = tmp_path / "sendable.csv"
+    config = tmp_path / "config.yaml"
+    sendable.write_text(
+        "email,template,subject,body,status,sendable\n"
+        "a@example.com,default,Hi,Body,,yes\n",
+        encoding="utf-8",
+    )
+    _seal_sendable(sendable)
+    _write_config(config)
+
+    class RecordingSMTP:
+        messages = []
+
+        def sendmail(self, _from, _recipients, message):
+            self.messages.append(message)
+            return {}
+
+        def quit(self):
+            pass
+
+    server = RecordingSMTP()
+    original_connect = mailer.connect_smtp
+    try:
+        mailer.connect_smtp = lambda _cfg: server
+        for _ in range(2):
+            mailer.cmd_send(
+                _send_args(
+                    sendable,
+                    config,
+                    redirect_to="sender@example.com",
+                    limit=1,
+                    sleep=0,
+                )
+            )
+    finally:
+        mailer.connect_smtp = original_connect
+
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    production_id = mailer._send_message_id(
+        str(rows.loc[0, "record_id"]), "sender@example.com"
+    )
+    observed_ids = []
+    for message in server.messages:
+        assert "\nDate:" in message
+        message_id_line = next(
+            line for line in message.splitlines() if line.startswith("Message-ID:")
+        )
+        observed_ids.append(message_id_line.split(":", 1)[1].strip())
+    assert len(set(observed_ids)) == 2
+    assert production_id not in observed_ids
+    assert production_id == mailer._send_message_id(
+        str(rows.loc[0, "record_id"]), "sender@example.com"
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "status", "evidence_count", "pending_count", "bounce_class"),
+    [
+        ("failed", "5.1.1", 1, 0, "hard"),
+        ("failed", "5.7.1", 1, 0, "soft"),
+        ("failed", "4.2.2", 1, 0, "soft"),
+        ("delayed", "4.2.0", 0, 1, None),
+        ("delivered", "2.0.0", 0, 1, None),
+        (None, "5.1.1", 1, 0, "unverified"),
+    ],
+)
+def test_structured_dsn_requires_action_status_and_exact_message_identity(
+    action, status, evidence_count, pending_count, bounce_class
+):
+    expected_message_id = "<mailpilot.exact@example.com>"
+    parsed = mailer._parse_bounce_candidate(
+        _dsn_message(
+            action=action,
+            status=status,
+            message_id=expected_message_id,
+        ),
+        uid="42",
+    )
+
+    assert len(parsed["evidence"]) == evidence_count
+    assert len(parsed["non_permanent"]) == pending_count
+    candidates = parsed["evidence"] or parsed["non_permanent"]
+    assert candidates[0]["message_ids"] == [expected_message_id]
+    if bounce_class is not None:
+        assert candidates[0]["bounce_class"] == bounce_class
+        assert candidates[0]["verified_failure"] is (action == "failed")
+
+
+def test_nonstandard_bounce_is_manual_review_only():
+    parsed = mailer._parse_bounce_candidate(
+        b"From: mailer-daemon@example.net\r\nSubject: Delivery failed\r\n\r\n"
+        b"Something went wrong without a structured DSN.\r\n",
+        uid="9",
+    )
+
+    assert parsed["evidence"] == []
+    assert parsed["non_permanent"] == []
+    assert len(parsed["unverified_candidates"]) == 1
+
+
+def test_imap_scan_uses_distinct_credentials_and_body_peek(monkeypatch):
+    raw = _dsn_message()
+    header = raw.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+
+    class FakeIMAP:
+        instance = None
+
+        def __init__(self, *args, **kwargs):
+            self.login_args = None
+            self.fetch_specs = []
+            FakeIMAP.instance = self
+
+        def login(self, user, password):
+            self.login_args = (user, password)
+
+        def select(self, mailbox, readonly=False):
+            assert (mailbox, readonly) == ("INBOX", True)
+            return "OK", [b"1"]
+
+        def uid(self, command, *args):
+            if command == "search":
+                return "OK", [b"7"]
+            uid, spec = args
+            self.fetch_specs.append((uid, spec))
+            payload = header if "HEADER.FIELDS" in spec else raw
+            return "OK", [(b"metadata", payload)]
+
+        def response(self, name):
+            assert name == "UIDVALIDITY"
+            return "UIDVALIDITY", [b"123"]
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(mailer.imaplib, "IMAP4_SSL", FakeIMAP)
+    result = mailer._extract_bounces(
+        {
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "imap_user": "bounce-reader@example.com",
+            "imap_password": "imap-secret",
+        },
+        lookback=50,
+    )
+
+    assert FakeIMAP.instance.login_args == (
+        "bounce-reader@example.com",
+        "imap-secret",
+    )
+    assert FakeIMAP.instance.fetch_specs == [
+        (b"7", "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT CONTENT-TYPE)])"),
+        (b"7", "(BODY.PEEK[])"),
+    ]
+    assert result["coverage"]["complete"] is True
+    assert result["coverage"]["uidvalidity"] == "123"
+    assert result["bounces"]["bad@example.com"]["evidence"][0][
+        "verified_failure"
+    ] is True
+
+
+def test_imap_fetch_failure_makes_coverage_incomplete(monkeypatch):
+    raw = _dsn_message()
+    header = raw.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+
+    class FailingIMAP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def login(self, _user, _password):
+            pass
+
+        def select(self, _mailbox, readonly=False):
+            return "OK", [b"1"]
+
+        def uid(self, command, *args):
+            if command == "search":
+                return "OK", [b"8"]
+            _uid, spec = args
+            if "HEADER.FIELDS" in spec:
+                return "OK", [(b"metadata", header)]
+            return "NO", []
+
+        def response(self, _name):
+            return "UIDVALIDITY", [b"456"]
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(mailer.imaplib, "IMAP4_SSL", FailingIMAP)
+    result = mailer._extract_bounces(
+        {
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "imap_user": "reader@example.com",
+            "imap_password": "secret",
+        },
+        lookback=50,
+    )
+
+    assert result["coverage"]["complete"] is False
+    assert result["coverage"]["fetch_errors"] == [{"uid": "8", "stage": "message"}]
+
+
+def test_dsn_evidence_from_two_messages_cannot_be_stitched_together(tmp_path):
+    _sendable, _rows, expected_message_id, args = _trusted_sent_batch(tmp_path)
+    extracted = {
+        "bounces": {
+            "bad@example.com": {
+                "reasons": ["failed without current identity", "current but unverified"],
+                "message_ids": {"<old@example.com>", expected_message_id},
+                "evidence": [
+                    {
+                        "reason": "failed without current identity",
+                        "message_ids": {"<old@example.com>"},
+                        "verified_failure": True,
+                        "action": "failed",
+                        "status": "5.1.1",
+                        "bounce_class": "hard",
+                    },
+                    {
+                        "reason": "current but unverified",
+                        "message_ids": {expected_message_id},
+                        "verified_failure": False,
+                        "action": "",
+                        "status": "",
+                        "bounce_class": "unverified",
+                    },
+                ],
+            }
+        },
+        "unverified_candidates": [
+            {
+                "uid": "99",
+                "email": "",
+                "reason": "malformed extra candidate",
+                "expected_message_id": "",
+                "observed_message_ids": [],
+            }
+        ],
+        "non_permanent": [],
+        "coverage": {"complete": True},
+    }
+    original_extract = mailer._extract_bounces
+    try:
+        mailer._extract_bounces = lambda cfg, lookback, since_time: extracted
+        result = mailer.cmd_bounces(args)
+    finally:
+        mailer._extract_bounces = original_extract
+
+    assert result["matched"] == 0
+    assert result["applied"] == 0
+    assert result["unverified"] == 2
+
+
+@pytest.mark.parametrize(("action", "expected_unverified"), [("delayed", 1), ("delivered", 0)])
+def test_current_message_delivery_state_controls_pending_review(
+    tmp_path, action, expected_unverified
+):
+    _sendable, _rows, expected_message_id, args = _trusted_sent_batch(tmp_path)
+    extracted = {
+        "bounces": {},
+        "unverified_candidates": [],
+        "non_permanent": [
+            {
+                "uid": "12",
+                "email": "bad@example.com",
+                "action": action,
+                "status": "4.2.0" if action == "delayed" else "2.0.0",
+                "reason": action,
+                "message_ids": [expected_message_id],
+            }
+        ],
+        "coverage": {"complete": True},
+    }
+    original_extract = mailer._extract_bounces
+    try:
+        mailer._extract_bounces = lambda cfg, lookback, since_time: extracted
+        result = mailer.cmd_bounces(args)
+    finally:
+        mailer._extract_bounces = original_extract
+
+    assert result["matched"] == 0
+    assert result["unverified"] == expected_unverified
+    if action == "delayed":
+        assert result["unverified_candidates"][0]["bounce_class"] == "pending"
+
+
+def test_gb18030_csv_works_in_cli_preview_and_web_column_preflight(tmp_path):
+    source_bytes = "姓名,邮箱\n小凯,kay@example.com\n".encode("gb18030")
+    source = tmp_path / "people.csv"
+    output = tmp_path / "sendable.csv"
+    source.write_bytes(source_bytes)
+
+    mailer.cmd_preview(
+        Namespace(
+            file=str(source),
+            out=str(output),
+            template="default",
+            email_col="邮箱",
+            name_col="姓名",
+            group_col="__none__",
+            sent_col="__none__",
+        )
+    )
+    rows = pd.read_csv(output, dtype=object).fillna("")
+    assert rows.loc[0, "name"] == "小凯"
+    assert rows.loc[0, "sendable"] == "yes"
+
+    web_app.RUNS_DIR = tmp_path / "runs"
+    web_app.app.config.update(TESTING=True)
+    response = web_app.app.test_client().post(
+        "/columns",
+        data={"recipients": (io.BytesIO(source_bytes), "people.csv")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    assert response.get_json()["columns"] == ["姓名", "邮箱"]
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("USER@例子.公司", "USER@xn--fsqu00a.xn--55qx5d"),
+        ("用户@example.com", None),
+        (f"{'a' * 65}@example.com", None),
+        ("a@example", None),
+        ("a..b@example.com", None),
+        ("a@example.com\r\nBcc: victim@example.com", None),
+    ],
+)
+def test_email_validation_is_conservative_and_idn_aware(address, expected):
+    assert mailer._valid_email(address) == expected
+
+
+def test_downloadable_status_csv_neutralizes_spreadsheet_formulas():
+    exported = web_app._spreadsheet_safe_export(
+        pd.DataFrame(
+            {
+                "name": ["=HYPERLINK(\"https://evil.invalid\")", " normal"],
+                "note": ["+cmd", "safe"],
+            }
+        )
+    )
+
+    assert exported.loc[0, "name"].startswith("'=")
+    assert exported.loc[0, "note"].startswith("'+")
+    assert exported.loc[1, "name"] == " normal"
+
+
+def test_local_web_app_rejects_untrusted_host_header():
+    web_app.app.config.update(TESTING=True)
+    response = web_app.app.test_client().get("/", headers={"Host": "evil.example"})
+
+    assert response.status_code == 400
+
+
+def test_normalized_config_keeps_smtp_and_imap_credentials_separate():
+    normalized = mailer.normalize_config(
+        {
+            "smtp": {
+                "host": "smtp.example.com",
+                "user": "sender@example.com",
+                "password": "smtp-secret",
+            },
+            "imap": {
+                "host": "imap.example.com",
+                "user": "bounce-reader@example.com",
+                "password": "imap-secret",
+            },
+            "from_addr": "sender@example.com",
+        }
+    )
+
+    assert normalized["user"] == "sender@example.com"
+    assert normalized["password"] == "smtp-secret"
+    assert normalized["imap_user"] == "bounce-reader@example.com"
+    assert normalized["imap_password"] == "imap-secret"
+
+
+def test_exchange_online_password_imap_is_blocked_before_network_access():
+    with pytest.raises(mailer.LedgerIntegrityError, match="does not implement IMAP OAuth"):
+        mailer._extract_bounces(
+            {
+                "imap_host": "outlook.office365.com",
+                "imap_port": 993,
+                "imap_user": "sender@example.com",
+                "imap_password": "password",
+            },
+            lookback=10,
+        )
+
+
+def test_web_template_redirect_testing_stops_after_first_provider_failure(tmp_path):
+    run_dir, sendable, token = _prepare_web_run(tmp_path, row_count=2)
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    rows.at[1, "template"] = "waitlist"
+    rows.to_csv(sendable, index=False)
+    _seal_sendable(sendable, engine=web_app.mailer)
+    reviewed = pd.read_csv(sendable, dtype=object).fillna("")
+    web_app._write_manifest(
+        run_dir,
+        content_hash=web_app._content_hash(reviewed),
+        batch_fingerprint=web_app._batch_fingerprint(reviewed),
+    )
+
+    class RejectingSMTP:
+        calls = 0
+
+        def sendmail(self, _from, _recipients, _message):
+            self.calls += 1
+            raise smtplib.SMTPDataError(421, b"temporary provider throttle")
+
+        def quit(self):
+            pass
+
+    server = RejectingSMTP()
+    original_connect = web_app.mailer.connect_smtp
+    try:
+        web_app.mailer.connect_smtp = lambda _cfg: server
+        web_app.app.config.update(TESTING=True)
+        response = web_app.app.test_client().post(
+            "/send",
+            data=_web_send_form(
+                run_dir,
+                sendable,
+                token,
+                action="test",
+                redirect_to="sender@example.com",
+                confirm_real_send="",
+                confirm_test_received="",
+                confirm_phrase="",
+            ),
+        )
+    finally:
+        web_app.mailer.connect_smtp = original_connect
+
+    assert response.status_code == 200
+    assert server.calls == 1
+    assert "后续模板测试已停止".encode() in response.data
+    assert not (run_dir / "redirect-test-passed.json").exists()
+
+
+def test_web_blocks_microsoft_365_production_before_smtp(tmp_path):
+    run_dir, sendable, token = _prepare_web_run(tmp_path, row_count=1)
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    form = _web_send_form(
+        run_dir,
+        sendable,
+        token,
+        host="smtp.office365.com",
+        port="587",
+        use_ssl="",
+    )
+    web_app._write_test_marker(run_dir, rows, ["default"], form)
+    calls = []
+    original_connect = web_app.mailer.connect_smtp
+    try:
+        web_app.mailer.connect_smtp = lambda _cfg: calls.append("connected")
+        web_app.app.config.update(TESTING=True)
+        response = web_app.app.test_client().post("/send", data=form)
+    finally:
+        web_app.mailer.connect_smtp = original_connect
+
+    assert response.status_code == 200
+    assert "Microsoft 365 正式发送已阻断".encode() in response.data
+    assert calls == []
+    assert not Path(web_app.mailer._default_ledger_path(str(sendable))).exists()

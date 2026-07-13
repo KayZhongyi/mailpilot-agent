@@ -11,6 +11,8 @@ smtp:
   use_ssl: true
   user: you@example.com
   password: YOUR_APP_PASSWORD_HERE      # app password / authorization code — NOT your login password
+  # Rotate proactively before providers enforce a lower per-connection message cap.
+  max_messages_per_connection: 50
 
   # Outlook / Microsoft 365:
   #   host: smtp.office365.com
@@ -25,13 +27,18 @@ smtp:
 from_addr: you@example.com
 from_name: Your Name
 
-# Unsubscribe contact for the List-Unsubscribe header (improves bulk deliverability;
-# Gmail/Yahoo bulk-sender rules expect it). Email or https URL. Defaults to from_addr if omitted.
+# Unsubscribe contact for a basic List-Unsubscribe header. This is NOT an RFC 8058
+# one-click endpoint and does not itself satisfy bulk-marketing compliance. Email or
+# https URL; defaults to from_addr if omitted.
 unsubscribe: you@example.com
 
 # IMAP — only needed for the `bounces` command, which reads bounce notifications in your inbox.
-# Auto-derived from smtp.host if omitted (smtp -> imap). Override if your provider differs
-# (e.g. Outlook IMAP is outlook.office365.com, Gmail is imap.gmail.com).
+# It may use a different app password, but the local web workflow requires the IMAP login
+# identity to equal the production SMTP user or from_addr. MailPilot v0.2 scans INBOX only;
+# it does NOT support IMAP OAuth or provider webhook/event APIs. Exchange Online password
+# IMAP is therefore unsupported in v0.2.
 # imap:
 #   host: imap.gmail.com
 #   port: 993
+#   user: you@example.com
+#   password: YOUR_IMAP_APP_PASSWORD_HERE

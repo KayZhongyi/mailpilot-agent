@@ -1,5 +1,8 @@
 # Secrets — never commit
-config.yaml
+config*.yaml
+!config.example.yaml
+.env
+.env.*
 
 # Generated output (may contain real recipient emails + send status)
 sendable.csv
@@ -19,6 +22,8 @@ sendable.csv
 .venv/
 
 # Real recipient lists — keep customer data out of the repo
+*.csv
+!samples/*.csv
 *.xlsx
 *.xls
 

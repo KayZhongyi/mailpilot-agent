@@ -38,6 +38,7 @@ for stale_pattern in ("mailpilot_*/smtp-*.yaml", "mailpilot_*/config.yaml"):
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["TRUSTED_HOSTS"] = ["127.0.0.1", "localhost"]
 CAPTURE_LOCK = threading.Lock()
 
 CSS = """
@@ -359,6 +360,11 @@ PAGE = """
         <div class="notice {{ message_kind }}">{{ message }}</div>
       {% endif %}
 
+      <div class="notice warn">
+        所有批次证据保存在项目目录的 <code>.mailpilot_runs</code>。升级、移动项目或换电脑前，
+        必须先退出 MailPilot，并完整复制这个目录；不要只复制上传的名单，也不要同时运行新旧两个副本。
+      </div>
+
       <div class="grid">
         {% if runs %}
           <section class="card full">
@@ -494,6 +500,18 @@ PAGE = """
               </div>
               <label>退订邮箱或网址</label>
               <input name="unsubscribe">
+              <label>单个 SMTP 连接最多尝试封数</label>
+              <input name="max_messages_per_connection" type="number" min="1" max="200" value="50" required>
+              <p class="help">默认每 50 封主动重连，避免服务商因单连接邮件数上限返回 421。若服务商给出更低限制，请按其文档填写。</p>
+              <p class="help">Microsoft 365：截至 2026 年 12 月密码型 SMTP AUTH 行为暂不变，但租户策略可能已禁用；之后将默认关闭。请让管理员确认，长期应迁移到 OAuth 或专业邮件服务。</p>
+              <div class="notice error">v0.2 不支持 Exchange Online 的 IMAP OAuth，因此无法完成本网页强制要求的退信扫描与归档。Microsoft 365 可做重定向测试，但网页正式发送会被阻断；请先换成能提供兼容密码 IMAP 退信邮箱的方案。</div>
+              <div class="notice warn">
+                MailPilot 无法读取你账号当天在别处已经发送的数量。个人 Gmail 常见上限约 500 封/天，
+                不能用来同日完成 1000 封；Google Workspace 及 Microsoft 365 也有账号/速率限制，
+                Exchange Online 还限制约 30 封/分钟。正式发送前请向管理员确认当前租户额度；
+                1000+ 外部或营销邮件优先使用已配置 SPF/DKIM/DMARC、支持退信/退订事件的专业服务。
+              </div>
+              <p class="help">“退订邮箱或网址”目前只添加 List-Unsubscribe 联系方式，不等于 RFC 8058 一键退订，也不会自动登记晚到退订请求。营销邮件必须另行建立合规退订和全局抑制流程。</p>
 
               <div class="row">
                 <div>
@@ -518,6 +536,7 @@ PAGE = """
               </div>
               <label><input type="checkbox" name="confirm_real_send"> 我已核对预览，明白正式发送会联系真实收件人。</label>
               <label><input type="checkbox" name="confirm_test_received"> 我已收到测试邮件，并检查了本活动的每个模板。</label>
+              <label><input type="checkbox" name="confirm_provider_quota"> 我已向邮箱管理员确认今天剩余额度和速率足够，并已计入在其他工具发送的邮件。</label>
               <label>正式发送时，请按上面的封数输入 <code>发送 N 封</code></label>
               <input name="confirm_phrase" placeholder="例如：发送 3 封">
               <div class="actions">
@@ -612,11 +631,13 @@ PAGE = """
                 <label>应用专用密码（仅保存在内存）</label><input name="imap_password" type="password" required>
                 <label>发件地址（必须与发送时一致）</label><input name="from_addr" required>
                 <label>本活动开始后最多扫描邮件数</label><input name="lookback" type="number" min="1" max="50000" value="5000" required>
+                <p class="help">当前只扫描 INBOX。请先人工检查 Spam/Junk，并把可能的退信移动或设置规则投递到 INBOX 后再扫描。</p>
                 <button type="submit">扫描退信，不修改状态</button>
               </form>
               {% if bounce_reconciliation %}
                 <div class="notice {{ 'success' if bounce_reconciliation.coverage.complete else 'error' }}">扫描 {{ bounce_reconciliation.checked_at }}：覆盖 {{ bounce_reconciliation.coverage.scanned_messages }}/{{ bounce_reconciliation.coverage.matching_messages }} 封活动开始后的邮箱邮件；可验证 {{ bounce_reconciliation.matched }} 条；仅地址相同但无法绑定 {{ bounce_reconciliation.unverified }} 条；已应用 {{ bounce_reconciliation.applied }} 条。</div>
                 {% if not bounce_reconciliation.coverage.complete %}<div class="notice error">扫描范围不完整，必须提高扫描上限并重新扫描，当前结果不能归档。</div>{% endif %}
+                {% if bounce_reconciliation.non_permanent %}<div class="notice warn">检测到 {{ bounce_reconciliation.non_permanent|length }} 条 delayed/delivered 等非永久通知；它们没有被标记为退信，也不会进入抑制名单。</div>{% endif %}
                 <p><a class="button" href="/runs/{{ run_name }}/bounces.json">下载完整退信核对报告</a></p>
                 {% if bounce_reconciliation.candidates %}
                   <h4>可自动验证的退信</h4>
@@ -774,7 +795,10 @@ def _status_counts(df):
         mailer.SUPPRESSED_STATUSES
     )
     unknown = status.eq("unknown") | initial_status.eq("unknown")
-    bounced = (status.eq("bounced") | initial_status.eq("bounced")) & ~unknown
+    bounced = (
+        status.isin(["bounced", "soft_bounced"])
+        | initial_status.isin(["bounced", "soft_bounced"])
+    ) & ~unknown
     error = (status.eq("error") | initial_status.eq("error")) & ~(unknown | bounced)
     historical_sent = initial_status.eq("sent") & ~(unknown | bounced | error)
     accepted = status.eq("sent") & ~(historical_sent | unknown | bounced | error)
@@ -812,6 +836,16 @@ def _table_html(df):
     columns = [c for c in ["name", "email", "template", "subject", "status", "sendable", "reason", "send_time", "send_error"] if c in df.columns]
     safe = df[columns].head(200).copy()
     return f'<div class="table-wrap">{safe.to_html(index=False, escape=True)}</div>'
+
+
+def _spreadsheet_safe_export(df):
+    dangerous = ("=", "+", "-", "@", "\t", "\r", "\n", "＝", "＋", "－", "＠")
+
+    def safe(value):
+        text = "" if pd.isna(value) else str(value)
+        return f"'{text}" if text.lstrip(" ").startswith(dangerous) else text
+
+    return df.apply(lambda column: column.map(safe))
 
 
 def _attention_rows(df):
@@ -990,6 +1024,9 @@ def _config_from_form(form):
             "use_ssl": bool(form.get("use_ssl")),
             "user": user,
             "password": form.get("password", ""),
+            "max_messages_per_connection": int(
+                form.get("max_messages_per_connection", "50") or 50
+            ),
         },
         "from_addr": from_addr,
         "from_name": form.get("from_name", "").strip(),
@@ -1001,20 +1038,24 @@ def _config_from_form(form):
 
 def _imap_config_from_form(form):
     user = form.get("imap_user", "").strip()
+    password = form.get("imap_password", "")
     imap_host = form.get("imap_host", "").strip()
+    from_addr = form.get("from_addr", "").strip() or user
     config = {
         "smtp": {
             "host": form.get("smtp_host", "").strip() or "smtp.local.invalid",
             "port": 465,
             "use_ssl": True,
             "user": user,
-            "password": form.get("imap_password", ""),
+            "password": password,
         },
         "imap": {
             "host": imap_host,
             "port": int(form.get("imap_port", "993") or 993),
+            "user": user,
+            "password": password,
         },
-        "from_addr": form.get("from_addr", "").strip() or user,
+        "from_addr": from_addr,
     }
     normalized = mailer.normalize_config(config)
     if not imap_host:
@@ -1709,7 +1750,8 @@ def download_status(run_name):
     ) as e:
         return _render(message=f"状态报告生成失败：{e}", message_kind="error")
     return Response(
-        "\ufeff" + df.to_csv(index=False, lineterminator="\n"),
+        "\ufeff"
+        + _spreadsheet_safe_export(df).to_csv(index=False, lineterminator="\n"),
         mimetype="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{run_name}-status.csv"'},
     )
@@ -1756,7 +1798,21 @@ def detect_columns():
         return jsonify(error="只支持 CSV 和 XLSX 文件。"), 400
     try:
         if suffix == ".csv":
-            frame = pd.read_csv(uploaded.stream, dtype=object, nrows=0)
+            last_error = None
+            for encoding in ("utf-8-sig", "gb18030"):
+                try:
+                    uploaded.stream.seek(0)
+                    frame = pd.read_csv(
+                        uploaded.stream,
+                        dtype=object,
+                        nrows=0,
+                        encoding=encoding,
+                    )
+                    break
+                except UnicodeDecodeError as e:
+                    last_error = e
+            else:
+                raise last_error or ValueError("无法识别 CSV 编码")
         else:
             frame = pd.read_excel(uploaded.stream, dtype=object, nrows=0)
     except Exception as e:
@@ -2039,6 +2095,8 @@ def send():
             return render_error("正式发送前必须勾选明确确认。")
         if not request.form.get("confirm_test_received"):
             return render_error("请先确认已经收到并核对重定向测试邮件。")
+        if not request.form.get("confirm_provider_quota"):
+            return render_error("请先向邮箱管理员确认当天剩余额度和速率，并勾选确认。")
         expected_phrase = f"发送 {limit} 封"
         if request.form.get("confirm_phrase", "").strip() != expected_phrase:
             return render_error(f"请输入准确短语“{expected_phrase}”来授权本次正式发送。")
@@ -2071,6 +2129,15 @@ def send():
             config_data = _config_from_form(request.form)
         except (OSError, TypeError, ValueError, SystemExit) as e:
             return render_error(f"SMTP 设置无效：{e}")
+        if (
+            action == "send"
+            and str(config_data.get("smtp", {}).get("host", "")).strip().lower()
+            in mailer.MICROSOFT_PASSWORD_SMTP_HOSTS
+        ):
+            return render_error(
+                "Microsoft 365 正式发送已阻断：v0.2 不支持 Exchange Online IMAP OAuth，"
+                "发送后无法完成强制退信扫描与归档。请改用能提供兼容 IMAP 退信邮箱的方案。"
+            )
 
     if action == "send":
         try:
@@ -2140,6 +2207,7 @@ def send():
             outputs = []
             ok = True
             for template_name in test_templates:
+                template_before = list(mailer._iter_ledger(str(test_ledger)) or [])
                 args = Namespace(
                     input=str(sendable_path),
                     config="",
@@ -2155,6 +2223,24 @@ def send():
                 run_ok, run_output = _capture(mailer.cmd_send, args)
                 outputs.append(f"=== Template: {template_name} ===\n{run_output}")
                 ok = ok and run_ok
+                template_after = list(mailer._iter_ledger(str(test_ledger)) or [])
+                template_events = template_after[len(template_before):]
+                template_accepted = any(
+                    event.get("status") == "test_sent"
+                    and str(event.get("template", "")) == template_name
+                    for event in template_events
+                )
+                if (
+                    not run_ok
+                    or not template_accepted
+                    or "unknown" in run_output.lower()
+                    or "✗" in run_output
+                ):
+                    ok = False
+                    outputs.append(
+                        "后续模板测试已停止：请先修复当前 SMTP/内容错误，避免重复触发服务商限制。"
+                    )
+                    break
             output = "\n\n".join(outputs)
             after_test_events = list(mailer._iter_ledger(str(test_ledger)) or [])
             new_events = after_test_events[len(before_test_events):]
@@ -2486,7 +2572,9 @@ def bounces_action():
                         production_identity.get("user", "")
                     ).strip().lower()
                     actual_from = str(normalized.get("from_addr", "")).strip().lower()
-                    actual_imap_user = str(normalized.get("user", "")).strip().lower()
+                    actual_imap_user = str(
+                        normalized.get("imap_user", "")
+                    ).strip().lower()
                     if not expected_from or actual_from != expected_from:
                         raise mailer.LedgerIntegrityError(
                             f"退信扫描的发件地址必须与正式发送一致：{expected_from}"
@@ -2534,7 +2622,7 @@ def bounces_action():
                         ),
                         "lookback": lookback,
                         "imap_host": normalized["imap_host"],
-                        "imap_user": normalized["user"],
+                        "imap_user": normalized["imap_user"],
                         "from_addr": result["from_addr"],
                         "production_smtp_identity": production_identity,
                         "identity_verified": True,
@@ -2550,6 +2638,7 @@ def bounces_action():
                         "unverified_candidates": result[
                             "unverified_candidates"
                         ],
+                        "non_permanent": result.get("non_permanent", []),
                         "production_ledger_hash": _file_hash(
                             mailer._default_ledger_path(str(sendable_path))
                         ),

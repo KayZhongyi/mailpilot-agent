@@ -31,6 +31,11 @@ track whether each one was sent and delivered. **Two modes:**
 - Once production starts, never create a replacement batch whose recipients overlap it. Reopen the original run and its ledger; mapping changes or a separate campaign require explicit reconciliation first.
 - If any row is `unknown`, stop the entire production batch. Require provider evidence, then record either confirmed acceptance or permanent suppression; never auto-retry an uncertain attempt.
 - For 1000+ work, use the local web UI to finish each activity explicitly: close outbound permanently, scan bounces with complete UID coverage, apply only Message-ID-bound DSNs, acknowledge visible unverified candidates, and archive. Only an archived web activity may authorize a new overlapping campaign.
+- Before 1000+ work, verify the provider's current daily/rate quota and count mail sent outside MailPilot. Personal Gmail cannot safely complete 1000 messages in one day; ordinary Microsoft 365 mailboxes also have rate limits. Prefer a specialist provider for external/marketing bulk mail.
+- Structured bounce evidence must prove `Action=failed`, a valid enhanced status, and this activity's exact Message-ID in the same DSN. `delayed`, malformed, and address-only reports remain manual-review items. Only narrow address-invalid statuses (`5.1.1`/`5.1.2`/`5.1.3`) may become cross-activity hard suppression; policy and temporary failures are activity-local `soft_bounced`.
+- The IMAP scanner reads `INBOX` only. Check Spam/Junk first. v0.2 has no IMAP OAuth and must block Exchange Online password IMAP. Provider event export cannot satisfy the audited archive gate because v0.2 has no event-import path; the web UI therefore blocks Microsoft 365 production while allowing redirected tests.
+- Preserve the whole `.mailpilot_runs` directory when upgrading or moving the app. Never operate old and new copies of one activity concurrently.
+- Never stage or commit recipient CSV/XLSX files, `config*.yaml`, `.env*`, ledgers, or `.mailpilot_runs`. Check `git status` before every commit; only the repository's public `samples/*.csv` fixtures are allowed.
 - **`send` marking a row `sent` only means "the mail server accepted it" — NOT that it was delivered.** Always run `bounces` afterward to reconcile.
 
 ## Workflow the agent should follow
@@ -40,7 +45,7 @@ track whether each one was sent and delivered. **Two modes:**
 3. **Preview**: user provides the list → run `preview` → read the per-group counts + one sample per group + the flagged un-sendable rows **out loud in the chat** for the user to review (do NOT email a report).
 4. **Wait for confirmation**: only proceed after the user says "send" (they may give a time). Send nothing before that.
 5. **Test first**: `send --redirect-to <sender inbox> --limit 3` so they see the real emails. The test inbox must exactly equal the SMTP user/From address and must not be present in the customer list. Redirected tests use a separate ledger and never mark customer rows as sent.
-6. **Send for real in bounded batches**: always provide `--limit` (maximum 200) and `--sleep` (minimum 1 second for production). Start with a small batch and report accepted/error/unknown counts back.
+6. **Send for real in bounded batches**: confirm the provider quota first, always provide `--limit` (maximum 200) and `--sleep` (minimum 1 second for production), and keep `smtp.max_messages_per_connection` at or below the provider's documented cap. Start with a small batch and report accepted/error/unknown counts back. A 4xx, sender/account failure, ambiguous outcome, or repeated identical DATA rejection stops the batch for review.
 7. **Close and reconcile in the web UI**: after ready/unknown/error are all zero, close outbound. Wait for the provider's bounce window, then scan using the recorded SMTP/From identity; only DSNs tied to this activity's deterministic Message-ID may be applied automatically. Address-only matches must be shown for manual review, and wrong mailbox identity or incomplete IMAP UID coverage blocks archive.
 8. **Archive in the web UI**: after a valid post-close bounce scan and all candidates are handled, archive and export the audit report. Never delete the run directory to start a new campaign. v0.2 archives are immutable, so scan again before archiving if late DSNs may still arrive.
 
@@ -104,12 +109,13 @@ Plain text + Jinja2 variables, in `templates/`:
 
 ## Config & docs
 
-- `config.example.yaml` — SMTP config template (copy to `config.yaml`). Includes `unsubscribe` (adds a `List-Unsubscribe` header to improve bulk deliverability) and optional `imap` (for `bounces`).
+- `config.example.yaml` — SMTP config template (copy to `config.yaml`). Includes connection rotation, a basic `List-Unsubscribe` contact header, and optional IMAP credentials. The web workflow permits a different app password but requires the IMAP login identity to equal the production SMTP user or From address. The header is not RFC 8058 one-click unsubscribe and is not a complete compliance workflow.
 - `references/email_provider_setup.md` — how to get an app password for Gmail / Outlook / NetEase, plus deliverability notes.
 - `samples/` — `event_registrations.csv` (grouped mode: confirmed / waitlist), `attendees.csv` (simple mode), and `messy_registrations.csv` (safety demo for invalid emails, missing templates, and already-sent rows).
 
 ## Known limits
 
 - **Agent-driven CLI commands require local execution** (Claude Code / Cowork / Codex CLI / Hermes). The Flask web UI needs no AI software and is the recommended path for non-technical teammates.
-- **Deliverability**: sending bulk to external/foreign inboxes from an ordinary mailbox may hit spam or rate limits. For one-off blasts of ~1000+, a transactional email service (Amazon SES / SendGrid / Mailgun / Aliyun DirectMail) delivers more reliably — switching only changes `config.yaml`. Always run `bounces` afterward.
+- **Deliverability/provider adapters**: sending bulk to external/foreign inboxes from an ordinary mailbox may hit spam or account limits. SMTP-capable transactional providers can be configured for sending, but v0.2 does not consume provider bounce/webhook exports or OAuth mailboxes automatically. Do not promise that changing only `config.yaml` provides end-to-end reconciliation.
+- **Unsubscribe**: v0.2 has no hosted RFC 8058 one-click endpoint and no UI for recording late opt-outs into a durable global suppression list. Use a compliant provider/upstream consent list for marketing mail; do not claim bulk-sender compliance from the header alone.
 - **Business decisions stay upstream**: never infer installation, parallel-operation, fraud, rebate eligibility, or rejection reasons. A business owner must provide a reviewed decision/template column and trustworthy historical send status before MailPilot may send.
