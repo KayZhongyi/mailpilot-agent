@@ -29,6 +29,8 @@ track whether each one was sent and delivered. **Two modes:**
 - Sending is **fail-closed on interruption**: `send` writes `attempting` before SMTP, then appends the result and atomically syncs the CSV. A result that cannot be proven becomes `unknown` and is never retried automatically.
 - Historical suppression is immutable after preview: clearing the current `status` does not make an originally `sent`, `bounced`, `unknown`, or suppressed row eligible again.
 - Once production starts, never create a replacement batch whose recipients overlap it. Reopen the original run and its ledger; mapping changes or a separate campaign require explicit reconciliation first.
+- If any row is `unknown`, stop the entire production batch. Require provider evidence, then record either confirmed acceptance or permanent suppression; never auto-retry an uncertain attempt.
+- For 1000+ work, use the local web UI to finish each activity explicitly: close outbound permanently, scan bounces with complete UID coverage, apply only Message-ID-bound DSNs, acknowledge visible unverified candidates, and archive. Only an archived web activity may authorize a new overlapping campaign.
 - **`send` marking a row `sent` only means "the mail server accepted it" — NOT that it was delivered.** Always run `bounces` afterward to reconcile.
 
 ## Workflow the agent should follow
@@ -39,7 +41,8 @@ track whether each one was sent and delivered. **Two modes:**
 4. **Wait for confirmation**: only proceed after the user says "send" (they may give a time). Send nothing before that.
 5. **Test first**: `send --redirect-to <sender inbox> --limit 3` so they see the real emails. The test inbox must exactly equal the SMTP user/From address and must not be present in the customer list. Redirected tests use a separate ledger and never mark customer rows as sent.
 6. **Send for real in bounded batches**: always provide `--limit` (maximum 200) and `--sleep` (minimum 1 second for production). Start with a small batch and report accepted/error/unknown counts back.
-7. **Reconcile bounces**: run `bounces` to mark undelivered rows `bounced`, and report that list to the user (those need manual follow-up).
+7. **Close and reconcile in the web UI**: after ready/unknown/error are all zero, close outbound. Wait for the provider's bounce window, then scan using the recorded SMTP/From identity; only DSNs tied to this activity's deterministic Message-ID may be applied automatically. Address-only matches must be shown for manual review, and wrong mailbox identity or incomplete IMAP UID coverage blocks archive.
+8. **Archive in the web UI**: after a valid post-close bounce scan and all candidates are handled, archive and export the audit report. Never delete the run directory to start a new campaign. v0.2 archives are immutable, so scan again before archiving if late DSNs may still arrive.
 
 ## Command reference
 
@@ -51,8 +54,8 @@ pip install pandas openpyxl jinja2 pyyaml certifi          # first-time deps
 python scripts/mailer.py doctor --config config.yaml        # check deps / config / SMTP
 
 # Preview (review in chat). Simple mode picks a template; grouped mode auto-detects the group column.
-python scripts/mailer.py preview list.xlsx --template default --out sendable.csv
-python scripts/mailer.py preview list.xlsx --out sendable.csv        # auto-groups if a group column exists
+python scripts/mailer.py preview list.xlsx --activity-id campaign-2026-07 --template default --out sendable.csv
+python scripts/mailer.py preview list.xlsx --activity-id campaign-2026-07 --out sendable.csv
 python scripts/mailer.py preview samples/messy_registrations.csv --out sendable.csv    # safety demo
 
 # Test send (use the SMTP user/From inbox, never a customer address)
@@ -65,7 +68,7 @@ python scripts/mailer.py send --input sendable.csv --config config.yaml --limit 
 #   --sleep 2                 pause 2s between emails (throttle for large batches)
 #   --only confirmed          send only one template/group
 
-# Reconcile bounces after sending
+# Low-level CLI bounce reconciliation after sending. Use the web UI for audited close/archive.
 python scripts/mailer.py bounces --input sendable.csv --config config.yaml            # preview
 python scripts/mailer.py bounces --input sendable.csv --config config.yaml --apply     # mark bounced rows
 ```
@@ -107,6 +110,6 @@ Plain text + Jinja2 variables, in `templates/`:
 
 ## Known limits
 
-- **Must run on a local-execution AI** (Claude Code / Cowork / Codex CLI / Hermes). Plain web chat sandboxes can't reach mail servers, so they can't actually send.
+- **Agent-driven CLI commands require local execution** (Claude Code / Cowork / Codex CLI / Hermes). The Flask web UI needs no AI software and is the recommended path for non-technical teammates.
 - **Deliverability**: sending bulk to external/foreign inboxes from an ordinary mailbox may hit spam or rate limits. For one-off blasts of ~1000+, a transactional email service (Amazon SES / SendGrid / Mailgun / Aliyun DirectMail) delivers more reliably — switching only changes `config.yaml`. Always run `bounces` afterward.
 - **Business decisions stay upstream**: never infer installation, parallel-operation, fraud, rebate eligibility, or rejection reasons. A business owner must provide a reviewed decision/template column and trustworthy historical send status before MailPilot may send.

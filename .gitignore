@@ -7,11 +7,16 @@ sendable.csv
 *.out.csv
 *.sendlog.jsonl
 *.testlog.jsonl
+*.lifecycle.jsonl
+*.lifecycle.jsonl.head.json
 *.sendlog.jsonl.started
 *.testlog.jsonl.started
+*.sendlog.jsonl.integrity.json
+*.testlog.jsonl.integrity.json
 *.lock
 *.tmp
 .mailpilot_runs/
+.venv/
 
 # Real recipient lists — keep customer data out of the repo
 *.xlsx

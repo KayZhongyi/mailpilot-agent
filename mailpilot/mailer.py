@@ -62,7 +62,7 @@ GROUP_ALIASES = [
 SENT_ALIASES = ["sent", "sent_flag", "已发", "已发送", "是否已发", "是否已发送", "是否发送", "发送状态", "已发状态"]
 
 SUPPRESSED_STATUSES = {"sent", "error", "bounced", "unsubscribed", "suppressed", "unknown"}
-LEDGER_STATUSES = SUPPRESSED_STATUSES | {"attempting"}
+LEDGER_STATUSES = SUPPRESSED_STATUSES | {"attempting", "retry_authorized"}
 
 
 class LedgerIntegrityError(RuntimeError):
@@ -221,8 +221,10 @@ def render(env, template_name, ctx):
 
 
 def read_table(path):
-    if path.lower().endswith((".xlsx", ".xls")):
+    if path.lower().endswith(".xlsx"):
         return pd.read_excel(path, dtype=object)
+    if path.lower().endswith(".xls"):
+        sys.exit("❌ Legacy .xls is not supported. Save the file as .xlsx or CSV first.")
     return pd.read_csv(path, dtype=object)
 
 
@@ -234,8 +236,293 @@ def _default_test_ledger_path(input_path):
     return f"{input_path}.testlog.jsonl"
 
 
+def _default_lifecycle_path(input_path):
+    return f"{input_path}.lifecycle.jsonl"
+
+
+def _lifecycle_head_path(input_path):
+    return f"{_default_lifecycle_path(input_path)}.head.json"
+
+
+def _atomic_write_json_file(path, payload):
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "x", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_parent(path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _lifecycle_event_hash(event):
+    payload = {key: value for key, value in event.items() if key != "event_hash"}
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_lifecycle(input_path):
+    path = _default_lifecycle_path(input_path)
+    if not os.path.exists(path):
+        head_path = _lifecycle_head_path(input_path)
+        if os.path.exists(head_path):
+            try:
+                with open(head_path, encoding="utf-8") as f:
+                    empty_head = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                raise LedgerIntegrityError("Lifecycle head marker is damaged.") from e
+            if empty_head.get("seq") == 0 and not empty_head.get("event_hash"):
+                return []
+            raise LedgerIntegrityError(
+                "Lifecycle ledger is missing although its durable head marker exists."
+            )
+        return []
+    events = []
+    previous_hash = ""
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise LedgerIntegrityError(
+                    f"Lifecycle ledger is damaged at line {line_no}: {path}."
+                ) from e
+            if not isinstance(event, dict):
+                raise LedgerIntegrityError(
+                    f"Lifecycle ledger line {line_no} is not an event object."
+                )
+            if event.get("seq") != len(events) + 1:
+                raise LedgerIntegrityError("Lifecycle ledger sequence is incomplete or reordered.")
+            if str(event.get("prev_hash", "")) != previous_hash:
+                raise LedgerIntegrityError("Lifecycle ledger hash chain is broken.")
+            actual_hash = str(event.get("event_hash", ""))
+            if not actual_hash or not hmac.compare_digest(
+                actual_hash, _lifecycle_event_hash(event)
+            ):
+                raise LedgerIntegrityError("Lifecycle ledger event hash is invalid.")
+            previous_hash = actual_hash
+            events.append(event)
+    head_path = _lifecycle_head_path(input_path)
+    if not os.path.exists(head_path):
+        raise LedgerIntegrityError("Lifecycle head marker is missing.")
+    try:
+        with open(head_path, encoding="utf-8") as f:
+            head = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise LedgerIntegrityError("Lifecycle head marker is damaged.") from e
+    head_seq = head.get("seq")
+    head_hash = str(head.get("event_hash", ""))
+    if head_seq == len(events) and hmac.compare_digest(head_hash, previous_hash):
+        return events
+    previous_event_hash = str(events[-2]["event_hash"]) if len(events) > 1 else ""
+    if head_seq == len(events) - 1 and hmac.compare_digest(
+        head_hash, previous_event_hash
+    ):
+        _atomic_write_json_file(
+            head_path,
+            {"seq": len(events), "event_hash": previous_hash},
+        )
+        return events
+    raise LedgerIntegrityError(
+        "Lifecycle ledger tail is missing or does not match its durable head marker."
+    )
+
+
+def _append_lifecycle(input_path, event):
+    events = _read_lifecycle(input_path)
+    head_path = _lifecycle_head_path(input_path)
+    if not events and not os.path.exists(head_path):
+        _atomic_write_json_file(head_path, {"seq": 0, "event_hash": ""})
+    payload = dict(event)
+    payload["seq"] = len(events) + 1
+    payload["prev_hash"] = str(events[-1]["event_hash"]) if events else ""
+    payload.setdefault(
+        "time", datetime.now().astimezone().isoformat(timespec="seconds")
+    )
+    payload["event_hash"] = _lifecycle_event_hash(payload)
+    _append_ledger(_default_lifecycle_path(input_path), payload)
+    _atomic_write_json_file(
+        head_path,
+        {"seq": payload["seq"], "event_hash": payload["event_hash"]},
+    )
+    return payload
+
+
+def _lifecycle_phase(input_path):
+    phase = "PREVIEW"
+    for event in _read_lifecycle(input_path):
+        event_name = str(event.get("event", ""))
+        if event_name == "outbound_opened":
+            phase = "OUTBOUND_OPEN"
+        elif event_name == "outbound_closed":
+            phase = "OUTBOUND_CLOSED"
+        elif event_name == "archived":
+            phase = "ARCHIVED"
+    return phase
+
+
+def _ensure_lifecycle_open(input_path, batch_id, production_ledger=None):
+    events = _read_lifecycle(input_path)
+    production_ledger = production_ledger or _default_ledger_path(input_path)
+    anchor = _ledger_anchor_path(production_ledger)
+
+    def bootstrap_events():
+        return list(_iter_ledger(production_ledger) or [])
+
+    if not events and (
+        os.path.exists(production_ledger)
+        or os.path.exists(anchor)
+        or os.path.exists(_ledger_integrity_path(production_ledger))
+    ):
+        try:
+            existing = bootstrap_events()
+        except LedgerIntegrityError as e:
+            raise LedgerIntegrityError(
+                "Production evidence exists but the lifecycle ledger is missing or incomplete. "
+                "Reconcile manually."
+            ) from e
+        if not (
+            len(existing) == 1
+            and existing[0].get("event") == "batch_started"
+            and str(existing[0].get("batch_id", "")) == str(batch_id)
+        ):
+            raise LedgerIntegrityError(
+                "Production evidence exists but the lifecycle ledger is missing. Reconcile manually."
+            )
+    phase = _lifecycle_phase(input_path)
+    if phase in ("OUTBOUND_CLOSED", "ARCHIVED"):
+        raise LedgerIntegrityError(
+            f"Batch lifecycle is {phase}; production sending can never resume from this batch."
+        )
+    if phase == "PREVIEW":
+        if not events:
+            if not os.path.exists(anchor):
+                _ensure_ledger_anchor(production_ledger, batch_id)
+            if not os.path.exists(production_ledger):
+                _append_ledger(
+                    production_ledger,
+                    {
+                        "event": "batch_started",
+                        "batch_id": str(batch_id),
+                        "status": "batch_started",
+                        "send_time": datetime.now().astimezone().isoformat(
+                            timespec="seconds"
+                        ),
+                    },
+                )
+        return _append_lifecycle(
+            input_path,
+            {"event": "outbound_opened", "batch_id": str(batch_id)},
+        )
+    if events and str(events[0].get("batch_id", "")) != str(batch_id):
+        raise LedgerIntegrityError("Lifecycle ledger belongs to a different batch.")
+    if phase == "OUTBOUND_OPEN":
+        if not os.path.exists(anchor):
+            raise LedgerIntegrityError(
+                "Lifecycle says outbound is open, but the production start marker is missing. "
+                "Do not resend until the batch is reconciled."
+            )
+        production_events = bootstrap_events()
+        if not production_events or production_events[0].get("event") != "batch_started":
+            raise LedgerIntegrityError(
+                "Production ledger has no trusted batch-start event. Do not resend."
+            )
+        if str(production_events[0].get("batch_id", "")) != str(batch_id):
+            raise LedgerIntegrityError(
+                "Production ledger batch-start event belongs to a different batch."
+            )
+    return events[0] if events else None
+
+
 def _ledger_anchor_path(ledger_path):
     return f"{ledger_path}.started"
+
+
+def _ledger_integrity_path(ledger_path):
+    return f"{ledger_path}.integrity.json"
+
+
+def _ledger_digest(ledger_path):
+    digest = hashlib.sha256()
+    size = 0
+    event_count = 0
+    with open(ledger_path, "rb") as f:
+        for line in f:
+            digest.update(line)
+            size += len(line)
+            if line.strip():
+                event_count += 1
+    return {
+        "sha256": digest.hexdigest(),
+        "size": size,
+        "event_count": event_count,
+    }
+
+
+def _validate_ledger_integrity(ledger_path, required=False):
+    marker_path = _ledger_integrity_path(ledger_path)
+    if not os.path.exists(marker_path):
+        if required:
+            raise LedgerIntegrityError(
+                f"Production ledger integrity marker is missing: {marker_path}. "
+                "Do not resend until the batch is reconciled."
+            )
+        return None
+    try:
+        with open(marker_path, encoding="utf-8") as f:
+            stored = json.load(f)
+        current = _ledger_digest(ledger_path)
+    except (OSError, json.JSONDecodeError) as e:
+        raise LedgerIntegrityError(
+            f"Production ledger integrity marker is damaged: {marker_path}."
+        ) from e
+    try:
+        matches = (
+            hmac.compare_digest(str(stored.get("sha256", "")), current["sha256"])
+            and int(stored.get("size", -1)) == current["size"]
+            and int(stored.get("event_count", -1)) == current["event_count"]
+        )
+    except (TypeError, ValueError):
+        matches = False
+    if not matches:
+        try:
+            stored_size = int(stored.get("size", -1))
+            stored_count = int(stored.get("event_count", -1))
+            with open(ledger_path, "rb") as f:
+                prefix = f.read(stored_size) if stored_size >= 0 else b""
+                suffix = f.read()
+            suffix_lines = [line for line in suffix.splitlines() if line.strip()]
+            recoverable_tail = (
+                stored_size >= 0
+                and stored_count >= 0
+                and current["size"] > stored_size
+                and hmac.compare_digest(
+                    hashlib.sha256(prefix).hexdigest(), str(stored.get("sha256", ""))
+                )
+                and (not prefix or prefix.endswith(b"\n"))
+                and suffix.endswith(b"\n")
+                and len(suffix_lines) == 1
+                and current["event_count"] == stored_count + 1
+                and isinstance(json.loads(suffix_lines[0].decode("utf-8")), dict)
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            recoverable_tail = False
+        if recoverable_tail:
+            _atomic_write_json_file(marker_path, current)
+            return current
+        raise LedgerIntegrityError(
+            "Production ledger does not match its durable integrity marker. "
+            "A complete event may be missing, added, or changed; do not resend."
+        )
+    return current
 
 
 def _check_ledger_presence(ledger_path):
@@ -283,7 +570,15 @@ def _ensure_ledger_anchor(ledger_path, batch_id):
 
 
 def _record_id(
-    idx, email_addr, template, subject, body, sendable="yes", reason="", initial_status=""
+    idx,
+    email_addr,
+    template,
+    subject,
+    body,
+    sendable="yes",
+    reason="",
+    initial_status="",
+    activity_id="",
 ):
     payload = json.dumps(
         [
@@ -295,6 +590,7 @@ def _record_id(
             sendable,
             reason,
             initial_status,
+            activity_id,
         ],
         ensure_ascii=False,
         separators=(",", ":"),
@@ -344,6 +640,7 @@ def _validate_reviewed_batch(df):
             str(row.get("sendable", "")).strip().lower(),
             str(row.get("reason", "")),
             str(row.get("initial_status", "")).strip().lower(),
+            str(row.get("activity_id", "")).strip(),
         )
         if not hmac.compare_digest(str(row.get("record_id", "")).strip(), expected):
             raise LedgerIntegrityError(
@@ -388,12 +685,18 @@ def _fsync_parent(path):
 def _append_ledger(path, event):
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     new_file = not os.path.exists(path)
+    anchored = os.path.exists(_ledger_anchor_path(path))
+    if anchored and not new_file:
+        _check_ledger_presence(path)
+        _validate_ledger_integrity(path, required=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
         f.flush()
         os.fsync(f.fileno())
     if new_file:
         _fsync_parent(path)
+    if anchored:
+        _atomic_write_json_file(_ledger_integrity_path(path), _ledger_digest(path))
 
 
 def _iter_ledger(path):
@@ -401,6 +704,8 @@ def _iter_ledger(path):
     if not path or not os.path.exists(path):
         return
     anchored = os.path.exists(_ledger_anchor_path(path))
+    if anchored:
+        _validate_ledger_integrity(path, required=True)
     seen_event = False
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
@@ -429,6 +734,13 @@ def _iter_ledger(path):
 def _apply_ledger(df, path):
     latest = {}
     for ev in _iter_ledger(path) or []:
+        if ev.get("event") == "batch_started":
+            current_batch_ids = set(df.get("batch_id", pd.Series(dtype=object)).astype(str))
+            if len(current_batch_ids) != 1 or str(ev.get("batch_id", "")) not in current_batch_ids:
+                raise LedgerIntegrityError(
+                    "Checkpoint batch-start event does not match the reviewed batch."
+                )
+            continue
         try:
             idx = int(ev["row"])
         except (KeyError, TypeError, ValueError) as e:
@@ -494,6 +806,12 @@ def _apply_ledger(df, path):
 
 def cmd_preview(args):
     df = read_table(args.file)
+    activity_id = str(getattr(args, "activity_id", "") or "").strip() or uuid.uuid4().hex
+    if activity_id and not re.fullmatch(r"[A-Za-z0-9._-]{2,80}", activity_id):
+        sys.exit(
+            "❌ --activity-id must use 2-80 letters, numbers, dots, dashes, or underscores."
+        )
+    print(f"Activity ID: {activity_id}")
     if args.email_col:
         email_col = _require_column(df, args.email_col, "Email")
     else:
@@ -612,12 +930,14 @@ def cmd_preview(args):
             sendable_value,
             reason,
             status,
+            activity_id,
         )
         rows.append({
             "record_id": record_id,
             "name": name, "email": email_v or "", "template": tpl,
             "subject": subject, "body": body, "status": status,
             "initial_status": status,
+            "activity_id": activity_id,
             "sendable": sendable_value, "reason": reason,
             "send_time": "", "send_error": "",
         })
@@ -696,9 +1016,10 @@ def _is_ambiguous_smtp_error(exc):
     return isinstance(exc, (smtplib.SMTPServerDisconnected, TimeoutError, OSError))
 
 
-def _send_message_id(record_id, from_addr):
+def _send_message_id(record_id, from_addr, activity_id=""):
     domain = str(from_addr).rsplit("@", 1)[-1] if "@" in str(from_addr) else "mailpilot.local"
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "", str(record_id))[:40] or uuid.uuid4().hex
+    identity = f"{activity_id}:{record_id}" if activity_id else str(record_id)
+    safe_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:40]
     return f"<mailpilot.{safe_id}@{domain}>"
 
 
@@ -713,6 +1034,15 @@ def _cmd_send_locked(args):
     applied = _apply_ledger(df, production_ledger)
     if applied:
         print(f"Recovered {applied} status update(s) from ledger: {production_ledger}")
+    unresolved_unknown = (
+        df["status"].astype(str).str.strip().str.lower().eq("unknown")
+        | df["initial_status"].astype(str).str.strip().str.lower().eq("unknown")
+    )
+    if unresolved_unknown.any() and not args.redirect_to and not args.dry_run:
+        raise LedgerIntegrityError(
+            f"Batch has {int(unresolved_unknown.sum())} unknown result(s). "
+            "Resolve them with evidence before any further production sending."
+        )
     targets = []
     for idx, r in df.iterrows():
         if str(r.get("sendable", "")).strip().lower() not in ("yes", "true", "1"):
@@ -778,14 +1108,16 @@ def _cmd_send_locked(args):
             sys.exit(
                 "❌ Test redirect is also a customer recipient. Use a separate sender test inbox."
             )
+    if not args.redirect_to:
+        batch_id = str(df["batch_id"].iloc[0])
+        _ensure_lifecycle_open(args.input, batch_id, production_ledger)
+        _ensure_ledger_anchor(production_ledger, batch_id)
     server = connect_smtp(cfg)
     unsub = _unsubscribe_header(cfg.get("unsubscribe"))
     sent = 0
     attempted = 0
     stop_after_current = False
     try:
-        if not args.redirect_to:
-            _ensure_ledger_anchor(production_ledger, str(df["batch_id"].iloc[0]))
         for idx, r, tpl, to in targets:
             if attempted >= args.limit:
                 break
@@ -799,6 +1131,7 @@ def _cmd_send_locked(args):
                 str(r.get("sendable", "")).strip().lower(),
                 str(r.get("reason", "")),
                 str(r.get("initial_status", "")).strip().lower(),
+                str(r.get("activity_id", "")).strip(),
             )
             batch_id = str(r.get("batch_id", "")).strip()
             attempt_id = uuid.uuid4().hex
@@ -807,7 +1140,12 @@ def _cmd_send_locked(args):
             msg["From"] = formataddr((str(Header(cfg.get("from_name", ""), "utf-8")), cfg["from_addr"]))
             msg["To"] = actual
             msg["Subject"] = Header(str(r.get("subject", "")), "utf-8")
-            msg["Message-ID"] = _send_message_id(record_id, cfg["from_addr"])
+            activity_id = str(r.get("activity_id", "")).strip()
+            msg["Message-ID"] = _send_message_id(
+                record_id, cfg["from_addr"], activity_id
+            )
+            if activity_id:
+                msg["X-MailPilot-Activity-ID"] = activity_id
             if unsub:
                 msg["List-Unsubscribe"] = unsub
             msg.attach(MIMEText(str(r.get("body", "")), "plain", "utf-8"))
@@ -817,6 +1155,7 @@ def _cmd_send_locked(args):
                 "row": int(idx),
                 "batch_id": batch_id,
                 "record_id": record_id,
+                "activity_id": activity_id,
                 "email": to,
                 "actual_recipient": actual,
                 "template": tpl,
@@ -921,75 +1260,270 @@ _BOUNCE_HINTS = ["postmaster", "mailer-daemon", "returned", "delivery", "undeliv
                  "退信", "无法投递", "投递失败"]
 
 
-def _extract_bounces(cfg, lookback):
+def _imap_since_date(value):
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return ""
+    months = (
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    )
+    return f"{parsed.day:02d}-{months[parsed.month - 1]}-{parsed.year:04d}"
+
+
+def _extract_bounces(cfg, lookback, since_time=""):
     ctx = _ssl_context()
     M = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=ctx)
-    M.login(cfg["user"], cfg["password"])
-    M.select("INBOX")
-    ids = M.search(None, "ALL")[1][0].split()
-    recent = ids[-lookback:] if lookback else ids
-    bounced = {}
-    for i in reversed(recent):
-        hdr = M.fetch(i, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")[1][0][1].decode("utf-8", "ignore")
-        m = email.message_from_string(hdr)
-        blob = _decode_hdr(m.get("From", "")).lower() + " " + _decode_hdr(m.get("Subject", "")).lower()
-        if not any(h in blob for h in _BOUNCE_HINTS):
-            continue
-        body = M.fetch(i, "(BODY.PEEK[TEXT])")[1][0][1].decode("utf-8", "ignore")
-        mrec = re.search(r"Final-Recipient:\s*rfc822;\s*([^\s<>]+@[^\s<>]+)", body, re.I) \
-            or re.search(r"(?:To|收件人)[\s:]+([^\s<>]+@[^\s<>]+\.[^\s<>]+)", body)
-        if not mrec:
-            continue
-        addr = mrec.group(1).strip().strip(">").lower()
-        mr = re.search(r"Diagnostic-Code:\s*(.+)", body) or re.search(r"(5\d\d[ \-]?\d?\.?\d?\.?\d?.{0,80})", body)
-        reason = re.sub(r"\s+", " ", mr.group(1).strip())[:160] if mr else "delivery failed (bounced)"
-        bounced.setdefault(addr, reason)
-    M.logout()
-    return bounced
+    try:
+        M.login(cfg["user"], cfg["password"])
+        M.select("INBOX")
+        since_date = _imap_since_date(since_time)
+        criteria = ("SINCE", since_date) if since_date else ("ALL",)
+        status, search_data = M.uid("search", None, *criteria)
+        if status != "OK":
+            raise LedgerIntegrityError("IMAP could not search the selected mailbox safely.")
+        ids = search_data[0].split() if search_data and search_data[0] else []
+        recent = ids[-lookback:] if lookback else ids
+        bounced = {}
+        for uid in reversed(recent):
+            header_data = M.uid(
+                "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])"
+            )[1]
+            hdr = header_data[0][1].decode("utf-8", "ignore")
+            message = email.message_from_string(hdr)
+            blob = (
+                _decode_hdr(message.get("From", "")).lower()
+                + " "
+                + _decode_hdr(message.get("Subject", "")).lower()
+            )
+            if not any(hint in blob for hint in _BOUNCE_HINTS):
+                continue
+            body_data = M.uid("fetch", uid, "(BODY.PEEK[TEXT])")[1]
+            body = body_data[0][1].decode("utf-8", "ignore")
+            recipient_match = re.search(
+                r"Final-Recipient:\s*rfc822;\s*([^\s<>]+@[^\s<>]+)", body, re.I
+            ) or re.search(
+                r"(?:To|收件人)[\s:]+([^\s<>]+@[^\s<>]+\.[^\s<>]+)", body
+            )
+            if not recipient_match:
+                continue
+            addr = recipient_match.group(1).strip().strip(">").lower()
+            diagnostic = re.search(r"Diagnostic-Code:\s*(.+)", body) or re.search(
+                r"(5\d\d[ \-]?\d?\.?\d?\.?\d?.{0,80})", body
+            )
+            reason = (
+                re.sub(r"\s+", " ", diagnostic.group(1).strip())[:160]
+                if diagnostic
+                else "delivery failed (bounced)"
+            )
+            original_ids = {
+                match.strip()
+                for match in re.findall(
+                    r"(?:Original-Message-ID|X-Original-Message-ID|Message-ID):\s*(<[^>]+>)",
+                    body,
+                    re.I,
+                )
+            }
+            entry = bounced.setdefault(addr, {"reasons": [], "message_ids": set()})
+            entry["reasons"].append(reason)
+            entry["message_ids"].update(original_ids)
+        uid_response = M.response("UIDVALIDITY")
+        uidvalidity = ""
+        if uid_response and len(uid_response) > 1 and uid_response[1]:
+            raw_uidvalidity = uid_response[1][0]
+            uidvalidity = (
+                raw_uidvalidity.decode("ascii", "ignore")
+                if isinstance(raw_uidvalidity, bytes)
+                else str(raw_uidvalidity)
+            )
+        return {
+            "bounces": bounced,
+            "coverage": {
+                "mailbox": "INBOX",
+                "uidvalidity": uidvalidity,
+                "query_since": since_date,
+                "first_uid": ids[0].decode("ascii", "ignore") if ids else "",
+                "last_uid": ids[-1].decode("ascii", "ignore") if ids else "",
+                "matching_messages": len(ids),
+                "scanned_messages": len(recent),
+                "complete": not lookback or len(ids) <= lookback,
+            },
+        }
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
 
 
 def _cmd_bounces_locked(args):
-    cfg = load_config(args.config)
     df = pd.read_csv(args.input, dtype=object).fillna("")
+    _validate_reviewed_batch(df)
+    if args.apply and _lifecycle_phase(args.input) == "ARCHIVED":
+        raise LedgerIntegrityError(
+            "Archived batches are immutable; late bounce evidence requires a new audit workflow."
+        )
     ledger_path = args.ledger or _default_ledger_path(args.input)
+    trusted_production_ledger = os.path.exists(_ledger_anchor_path(ledger_path))
     applied = _apply_ledger(df, ledger_path)
     if applied:
         print(f"Recovered {applied} status update(s) from ledger: {ledger_path}")
+    config_data = getattr(args, "config_data", None)
+    cfg = normalize_config(config_data) if config_data is not None else load_config(args.config)
+    ledger_events = list(_iter_ledger(ledger_path) or [])
+    event_times = [
+        str(event.get("send_time", ""))
+        for event in ledger_events
+        if str(event.get("send_time", "")).strip()
+    ]
+    since_time = min(event_times) if event_times else ""
     print(f"Connecting to IMAP {cfg['imap_host']}:{cfg['imap_port']} to read bounce notifications…")
-    bounced = _extract_bounces(cfg, args.lookback)
+    extracted = _extract_bounces(cfg, args.lookback, since_time)
+    bounced = extracted["bounces"]
+    coverage = extracted["coverage"]
     print(f"Found {len(bounced)} bounced address(es) in your mailbox.")
-    for a, rn in bounced.items():
-        print(f"  ✗ {a} : {rn}")
+    if not coverage.get("complete"):
+        print(
+            "⚠️  Bounce scan coverage is incomplete. Increase the lookback before archiving."
+        )
+    for address, evidence in bounced.items():
+        reasons = evidence.get("reasons", [])
+        reason = reasons[0] if reasons else "delivery failed (bounced)"
+        print(f"  ✗ {address} : {reason}")
+    latest_ledger_status = {}
+    for event in ledger_events:
+        if event.get("event") == "batch_started":
+            continue
+        latest_ledger_status[int(event["row"])] = str(event.get("status", "")).strip()
     matched = []
+    unverified = []
     for idx, r in df.iterrows():
         to = str(r.get("email", "")).strip().lower()
         st = str(r.get("status", "")).strip().lower()
-        if to and to in bounced and st in ("sent", "error", ""):
-            matched.append((idx, to))
+        if not to or to not in bounced or st == "bounced":
+            continue
+        expected_message_id = _send_message_id(
+            str(r.get("record_id", "")).strip(),
+            cfg["from_addr"],
+            str(r.get("activity_id", "")).strip(),
+        )
+        evidence = bounced[to]
+        proven_sent = (
+            trusted_production_ledger
+            and latest_ledger_status.get(int(idx)) == "sent"
+            and st == "sent"
+        )
+        message_id_matches = expected_message_id in set(evidence.get("message_ids", set()))
+        if proven_sent and message_id_matches:
+            matched.append(
+                {
+                    "row": int(idx),
+                    "batch_id": str(r.get("batch_id", "")),
+                    "record_id": str(r.get("record_id", "")),
+                    "activity_id": str(r.get("activity_id", "")),
+                    "email": to,
+                    "message_id": expected_message_id,
+                    "reason": evidence["reasons"][0],
+                }
+            )
+        else:
+            unverified.append(
+                {
+                    "row": int(idx),
+                    "email": to,
+                    "reason": evidence["reasons"][0],
+                    "expected_message_id": expected_message_id,
+                    "observed_message_ids": sorted(
+                        set(evidence.get("message_ids", set()))
+                    ),
+                }
+            )
     print(f"\nMatched against {args.input}: {len(matched)} row(s).")
-    for idx, to in matched:
-        print(f"  row {idx} {to} -> bounced")
+    for candidate in matched:
+        print(f"  row {candidate['row']} {candidate['email']} -> bounced")
+    if unverified:
+        print(
+            f"Unverified address-only candidate(s): {len(unverified)}. "
+            "These are NOT changed automatically because the current batch/Message-ID "
+            "could not be proven."
+        )
+        for candidate in unverified:
+            print(
+                f"  row {candidate['row']} {candidate['email']} -> manual review required"
+            )
+    result = {
+        "found": len(bounced),
+        "matched": len(matched),
+        "unverified": len(unverified),
+        "applied": 0,
+        "candidates": matched,
+        "unverified_candidates": unverified,
+        "from_addr": cfg["from_addr"],
+        "coverage": coverage,
+    }
     if not matched:
         print("(No rows to mark. Note: emails sent with --redirect-to can't be matched by recipient.)")
-        return
+        return result
     if not args.apply:
         print("\n[preview] Not written back. Add --apply to mark these rows as bounced.")
-        return
-    for idx, to in matched:
+        return result
+    result["applied"] = _apply_bounce_candidates(
+        df, args.input, ledger_path, matched, cfg["from_addr"]
+    )
+    print(f"\n✅ Marked {result['applied']} row(s) as bounced. Ledger: {ledger_path}. Wrote reasons to {args.input}")
+    return result
+
+
+def _apply_bounce_candidates(df, input_path, ledger_path, candidates, from_addr):
+    _validate_reviewed_batch(df)
+    batch_id = str(df["batch_id"].iloc[0])
+    _ensure_ledger_anchor(ledger_path, batch_id)
+    applied = 0
+    for candidate in candidates:
+        idx = int(candidate["row"])
+        if idx not in df.index:
+            raise LedgerIntegrityError(f"Bounce candidate row {idx} no longer exists.")
+        to = str(df.at[idx, "email"]).strip().lower()
+        record_id = str(df.at[idx, "record_id"]).strip()
+        current_status = str(df.at[idx, "status"]).strip().lower()
+        if (
+            to != str(candidate.get("email", "")).strip().lower()
+            or record_id != str(candidate.get("record_id", "")).strip()
+            or batch_id != str(candidate.get("batch_id", "")).strip()
+            or current_status != "sent"
+        ):
+            raise LedgerIntegrityError(
+                f"Bounce candidate row {idx} changed after scan; rescan before applying."
+            )
+        activity_id = str(df.at[idx, "activity_id"]).strip() if "activity_id" in df else ""
+        if activity_id != str(candidate.get("activity_id", "")).strip():
+            raise LedgerIntegrityError(
+                f"Bounce candidate row {idx} belongs to a different activity."
+            )
+        expected_message_id = _send_message_id(record_id, from_addr, activity_id)
+        if not hmac.compare_digest(
+            expected_message_id, str(candidate.get("message_id", ""))
+        ):
+            raise LedgerIntegrityError(
+                f"Bounce candidate row {idx} is not bound to this MailPilot message."
+            )
+        reason = str(candidate.get("reason", "delivery failed (bounced)"))[:160]
         _append_ledger(ledger_path, {
             "event": "bounce_result",
             "row": int(idx),
-            "batch_id": str(df.at[idx, "batch_id"]) if "batch_id" in df.columns else "",
-            "record_id": str(df.at[idx, "record_id"]) if "record_id" in df.columns else "",
+            "batch_id": batch_id,
+            "record_id": record_id,
             "email": to,
             "status": "bounced",
-            "send_error": bounced[to],
+            "send_error": reason,
             "send_time": str(df.at[idx, "send_time"]) if "send_time" in df.columns else "",
         })
         df.at[idx, "status"] = "bounced"
-        df.at[idx, "send_error"] = bounced[to]
-    _atomic_write_csv(df, args.input)
-    print(f"\n✅ Marked {len(matched)} row(s) as bounced. Ledger: {ledger_path}. Wrote reasons to {args.input}")
+        df.at[idx, "send_error"] = reason
+        applied += 1
+    _atomic_write_csv(df, input_path)
+    return applied
 
 
 def cmd_bounces(args):
@@ -1126,6 +1660,11 @@ def main():
         "--sent-col",
         default=None,
         help="Column that proves a row was already sent; use __none__ only after explicit review",
+    )
+    pp.add_argument(
+        "--activity-id",
+        default="",
+        help="Campaign namespace; use a new value only for an explicitly new activity",
     )
     pp.set_defaults(func=cmd_preview)
 

@@ -16,9 +16,11 @@ It is designed for careful workflows like pre-sales follow-ups, event notificati
 - **Fail-closed resume**: writes `attempting` before SMTP and the result afterward. An interrupted,
   uncertain attempt becomes `unknown` and is never retried automatically.
 - **Safe testing**: redirected tests can only go to the SMTP/From address, never to an address in the customer list.
-- **Duplicate-batch guard**: once production starts, a new batch that overlaps any of its recipients is blocked and reopens the original batch instead of creating a second send ledger.
+- **Duplicate-batch guard in the local web UI**: once production starts, an overlapping upload reopens the original batch instead of creating a second send ledger.
 - **Schedule and throttle**: send later with `--at`, or slow down batches with `--sleep`.
-- **Bounce reconciliation**: scan bounce notifications through IMAP and mark undelivered rows.
+- **Bounce reconciliation**: bind IMAP to the recorded production sender, scan from the activity start date, record UID coverage, and automatically apply only DSNs with the exact activity Message-ID.
+- **Explicit web activity lifecycle**: production open → resolve uncertainty → close outbound → scan/apply bounces → archive.
+- **Auditable web campaigns**: overlapping recipients stay blocked until the old activity is archived and a one-time new-activity authorization is created.
 - **Local-first**: no SaaS account, no telemetry, no database required.
 - **Local web UI**: teammates can use a browser-based interface without any AI software.
 
@@ -54,12 +56,16 @@ http://localhost:8501
 The UI lets you:
 
 - upload a CSV/XLSX list
+- read its headers locally and suggest email/name/group/history column mappings for confirmation
+- name the activity so operators can distinguish campaigns
 - reopen an interrupted batch with its original checkpoint ledger
 - preview grouped or simple templates
 - inspect blocked rows before sending
 - inspect the local templates used by each group
 - run dry-runs or redirected test sends
 - require explicit confirmation before real sending
+- resolve `unknown` / definite failures with evidence notes
+- close outbound permanently, scan IMAP bounces, download full status/audit reports, and archive the activity
 
 No AI software is required for the web UI. Everything runs locally on your computer.
 
@@ -72,6 +78,17 @@ For a 1000+ recipient job, do not authorize all rows at once. Verify the trusted
 column, preview the whole file, test every template to the sender inbox, then send in web batches of
 at most 100 (CLI: 200) with at least one second between attempts. Reopen the same batch after every
 interruption.
+
+If any attempt becomes `unknown`, MailPilot pauses the entire production batch. Check the provider
+logs, then record either “confirmed accepted” or “permanently do not retry” with an evidence note.
+Do not guess. After the last outbound decision, close outbound, scan bounces, apply only DSNs whose
+Message-ID matches this activity, acknowledge any unverified candidates, and archive the activity.
+The scan report shows every candidate and records the IMAP UID range. If the configured scan cap did
+not cover every message since the activity began, archiving is blocked.
+
+Do not archive immediately after the last send. Wait for the bounce window recommended by your mail
+provider (commonly at least 24–72 hours), scan again, then archive. An archive is immutable; the
+current v0.2 web UI does not append late DSNs received after archival.
 
 ## Safety Demo
 
@@ -119,8 +136,11 @@ python scripts/mailer.py doctor --config config.yaml
 Preview a grouped list:
 
 ```bash
-python scripts/mailer.py preview samples/event_registrations.csv --out sendable.csv
+python scripts/mailer.py preview samples/event_registrations.csv --activity-id event-2026-july --out sendable.csv
 ```
+
+If `--activity-id` is omitted, preview generates a fresh random ID so a later campaign cannot reuse
+the same Message-ID namespace accidentally.
 
 Preview a simple one-template list:
 
@@ -149,6 +169,11 @@ Reconcile bounces:
 python scripts/mailer.py bounces --input sendable.csv --config config.yaml --apply
 ```
 
+The CLI is a low-level single-batch interface. It has the same fail-closed SMTP recovery and
+Message-ID bounce matching, but v0.2 does not provide CLI commands for web-style close/archive or
+cross-folder duplicate-campaign authorization. Use the local web UI for the complete audited
+1000+ workflow.
+
 ## Installable CLI
 
 You can also install it as a local CLI:
@@ -160,7 +185,7 @@ python -m pip install -e .
 Then use:
 
 ```bash
-mailpilot preview samples/event_registrations.csv --out sendable.csv
+mailpilot preview samples/event_registrations.csv --activity-id event-2026-july --out sendable.csv
 mailpilot send --input sendable.csv --config config.yaml --dry-run
 ```
 
@@ -185,6 +210,13 @@ During sending, it sends one email at a time and appends the result to a JSONL l
 sendable.csv.sendlog.jsonl
 ```
 
+The production ledger is paired with a durable start marker and integrity digest. MailPilot refuses
+to resume if a complete JSONL event, the whole ledger, or either marker disappears. A non-recipient
+`batch_started` event makes ordinary SMTP login/network failures safely retryable before the first
+message attempt. If power is lost after exactly one complete tail event is fsynced but before its
+digest/head update, MailPilot verifies the previous digest and repairs only that one valid tail;
+partial or multiple unexplained changes remain blocked.
+
 If the process stops halfway through, run the same command again. MailPilot replays the ledger first
 and skips rows already accepted by SMTP. If a process stopped after an attempt began but before a
 definite SMTP result was recorded, that row becomes `unknown` and requires manual reconciliation;
@@ -193,6 +225,24 @@ MailPilot will not risk sending it twice automatically.
 The status imported during preview is also sealed as immutable history. Clearing a current `status`
 cell later cannot turn a historically sent, bounced, suppressed, or uncertain row back into a
 sendable row.
+
+### Finishing an activity safely
+
+The local web app uses these persistent phases:
+
+```text
+PREVIEW -> OUTBOUND_OPEN -> OUTBOUND_CLOSED -> ARCHIVED
+```
+
+- `OUTBOUND_OPEN`: bounded sending and evidence-backed exception handling are allowed.
+- `OUTBOUND_CLOSED`: the batch can never send again; scan and apply bounces next.
+- `ARCHIVED`: manifest, production ledger, lifecycle ledger, bounce report, and counts are sealed in
+  `archive-receipt.json`.
+
+Re-uploading overlapping recipients still opens the archived activity by default. To start a truly
+new campaign, open the archive, choose **Start a new activity**, type the exact confirmation phrase,
+then upload the new list within 30 minutes. A new Activity ID gives the campaign a separate
+Message-ID namespace. Addresses previously marked `bounced` or `unsubscribed` remain blocked.
 
 The CSV is still updated for convenience, but it is written atomically instead of being rewritten after every single email.
 
@@ -357,6 +407,31 @@ Run checks:
 python -m pytest
 python -m ruff check .
 ```
+
+Run the complete offline safety acceptance gate (all tests forbid real socket connections):
+
+```bash
+python scripts/safety_acceptance.py
+```
+
+Non-technical macOS/Windows users can double-click `run_safety_acceptance.command` or
+`run_safety_acceptance.bat` after the current app launcher has completed its one-time environment
+setup. That setup installs the test tools too. The acceptance launcher itself never installs or
+downloads anything; the suite uses Fake SMTP and Fake IMAP only and never logs into a mailbox.
+
+## Double-click startup troubleshooting
+
+- The launchers create a project-local `.venv`; they do not install packages into the global Python.
+- First launch needs internet to install dependencies. Later launches reuse the local environment.
+- Keep the terminal window open while using MailPilot.
+- The app binds `127.0.0.1:8501` before opening the browser, preventing the former
+  `ERR_CONNECTION_REFUSED` startup race.
+- If port 8501 is occupied, close the older MailPilot terminal and retry.
+- On macOS, if Gatekeeper blocks the launcher, right-click it and choose **Open** once.
+- On Windows, install Python 3 with **Add Python to PATH** enabled. Failures remain visible in the
+  terminal; press a key only after copying the error for the maintainer.
+- The repository CI is configured for Windows, macOS, and Linux. A real Windows double-click still
+  needs to be recorded on a Windows computer before calling that launcher field-tested.
 
 ## Roadmap
 

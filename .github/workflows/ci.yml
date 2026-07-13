@@ -6,9 +6,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -25,3 +27,26 @@ jobs:
         run: ruff check .
       - name: Test
         run: pytest
+      - name: Flask offline smoke test
+        run: python -c "import app; r=app.app.test_client().get('/'); assert r.status_code == 200"
+      - name: Unix launcher syntax
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash -n run_mailpilot_app.command run_safety_acceptance.command
+      - name: Unix launcher smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python -m venv --system-site-packages .venv
+          touch .venv/.mailpilot-ready-v0.2.0
+          MAILPILOT_SMOKE=1 ./run_mailpilot_app.command
+      - name: Windows launcher smoke
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          python -m venv --system-site-packages .venv
+          type nul > .venv\.mailpilot-ready-v0.2.0
+          set MAILPILOT_SMOKE=1
+          call run_mailpilot_app.bat
+          if errorlevel 1 exit /b 1
+          findstr /C:"safety_acceptance.py" run_safety_acceptance.bat
