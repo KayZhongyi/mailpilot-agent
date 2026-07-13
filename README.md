@@ -53,6 +53,7 @@ http://localhost:8501
 The UI lets you:
 
 - upload a CSV/XLSX list
+- reopen an interrupted batch with its original checkpoint ledger
 - preview grouped or simple templates
 - inspect blocked rows before sending
 - inspect the local templates used by each group
@@ -60,6 +61,9 @@ The UI lets you:
 - require explicit confirmation before real sending
 
 No AI software is required for the web UI. Everything runs locally on your computer.
+
+After a restart, use **Resume an existing batch**. Uploading the exact same source file again opens
+the original batch instead of creating a second send ledger.
 
 ## Safety Demo
 

@@ -7,11 +7,14 @@ reuses the same preview/send engine as the CLI and Agent Skill.
 
 from argparse import Namespace
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 import hashlib
 import io
+import json
 import os
 import secrets
+import shutil
 import tempfile
 import webbrowser
 
@@ -349,6 +352,30 @@ PAGE = """
       {% endif %}
 
       <div class="grid">
+        {% if runs %}
+          <section class="card full">
+            <h2>Resume an existing batch</h2>
+            <p class="help">Always reopen the original batch after interruption. Do not upload the same list again.</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Batch</th><th>Updated</th><th>Ready</th><th>Accepted / suppressed</th><th>Blocked</th><th></th></tr></thead>
+                <tbody>
+                  {% for run in runs %}
+                    <tr>
+                      <td><code>{{ run.name }}</code></td>
+                      <td>{{ run.updated }}</td>
+                      <td>{{ run.metrics.ready }}</td>
+                      <td>{{ run.metrics.skipped }}</td>
+                      <td>{{ run.metrics.blocked }}</td>
+                      <td><a class="button" href="{{ run.url }}">Resume safely</a></td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        {% endif %}
+
         <section class="card" id="preview">
           <h2>Upload and preview</h2>
           <p class="help">Nothing is sent here. MailPilot renders templates and flags unsafe rows.</p>
@@ -622,6 +649,79 @@ def _consume_action_token(run_dir, submitted):
         return None
 
 
+def _sha256_path(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_manifest(run_dir, **values):
+    path = Path(run_dir) / "manifest.json"
+    current = {}
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = {}
+    current.update(values)
+    tmp = path.with_suffix(f".{secrets.token_hex(6)}.tmp")
+    tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _find_existing_batch(source_hash, exclude=None):
+    RUNS_DIR.mkdir(exist_ok=True)
+    for run in RUNS_DIR.glob("mailpilot_*"):
+        if exclude and run == exclude:
+            continue
+        manifest = run / "manifest.json"
+        if not manifest.exists() or not (run / "sendable.csv").exists():
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if secrets.compare_digest(str(data.get("source_hash", "")), source_hash):
+            return run
+    return None
+
+
+def _run_from_name(name):
+    if not name.startswith("mailpilot_") or Path(name).name != name:
+        return None
+    try:
+        run = (RUNS_DIR / name).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return run if run.parent == RUNS_DIR.resolve() else None
+
+
+def _run_summaries():
+    RUNS_DIR.mkdir(exist_ok=True)
+    summaries = []
+    for run in sorted(RUNS_DIR.glob("mailpilot_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        sendable = run / "sendable.csv"
+        if not sendable.exists():
+            continue
+        try:
+            df = _read_sendable(sendable)
+            mailer._apply_ledger(df, mailer._default_ledger_path(str(sendable)))
+            metrics = _metric_counts(df)
+        except Exception:
+            metrics = {"ready": 0, "skipped": 0, "blocked": "review required"}
+        summaries.append(
+            {
+                "name": run.name,
+                "updated": datetime.fromtimestamp(run.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "metrics": metrics,
+                "url": f"/runs/{run.name}",
+            }
+        )
+    return summaries
+
+
 def _render(**kwargs):
     defaults = {
         "css": CSS,
@@ -634,6 +734,7 @@ def _render(**kwargs):
         "sendable_path": "",
         "run_dir": "",
         "action_token": "",
+        "runs": _run_summaries(),
         "metrics": {"ready": 0, "skipped": 0, "blocked": 0},
         "table_html": "",
     }
@@ -646,6 +747,52 @@ def index():
     return _render()
 
 
+@app.get("/runs/<run_name>")
+def resume_run(run_name):
+    run_dir = _run_from_name(run_name)
+    if not run_dir:
+        return redirect(url_for("index"))
+    sendable_path = run_dir / "sendable.csv"
+    if not sendable_path.exists():
+        return redirect(url_for("index"))
+    try:
+        df = _read_sendable(sendable_path)
+        mailer._apply_ledger(df, mailer._default_ledger_path(str(sendable_path)))
+        manifest_path = run_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise mailer.LedgerIntegrityError("Batch manifest is missing.")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not secrets.compare_digest(
+            str(manifest.get("content_hash", "")), _content_hash(df)
+        ):
+            raise mailer.LedgerIntegrityError(
+                "The reviewed recipient/content manifest no longer matches this batch."
+            )
+    except (OSError, json.JSONDecodeError, mailer.LedgerIntegrityError) as e:
+        return _render(
+            message=f"Recovery blocked for safety: {e}",
+            message_kind="error",
+            preview_output=(run_dir / "preview.txt").read_text(encoding="utf-8")
+            if (run_dir / "preview.txt").exists()
+            else "",
+            metrics={"ready": 0, "skipped": 0, "blocked": len(df) if "df" in locals() else 0},
+            table_html=_table_html(df) if "df" in locals() else "",
+        )
+
+    return _render(
+        message="Existing batch reopened with its original checkpoint ledger. Already accepted and suppressed rows will not be sent again.",
+        message_kind="success",
+        preview_output=(run_dir / "preview.txt").read_text(encoding="utf-8")
+        if (run_dir / "preview.txt").exists()
+        else "",
+        sendable_path=str(sendable_path),
+        run_dir=str(run_dir),
+        action_token=_new_action_token(run_dir),
+        metrics=_metric_counts(df),
+        table_html=_table_html(df),
+    )
+
+
 @app.post("/preview")
 def preview():
     uploaded = request.files.get("recipients")
@@ -655,9 +802,15 @@ def preview():
     suffix = Path(uploaded.filename).suffix.lower() or ".csv"
     if suffix not in (".csv", ".xlsx"):
         return _render(message="Only CSV and XLSX files are accepted.", message_kind="error")
+    RUNS_DIR.mkdir(exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="mailpilot_", dir=RUNS_DIR))
     source_path = run_dir / f"recipients{suffix}"
     uploaded.save(source_path)
+    source_hash = _sha256_path(source_path)
+    existing = _find_existing_batch(source_hash, exclude=run_dir)
+    if existing:
+        shutil.rmtree(run_dir)
+        return redirect(url_for("resume_run", run_name=existing.name))
     out_path = run_dir / "sendable.csv"
 
     mode = request.form.get("mode")
@@ -688,6 +841,15 @@ def preview():
     )
     ok, output = _capture(mailer.cmd_preview, args)
     df = _read_sendable(out_path)
+    if ok:
+        (run_dir / "preview.txt").write_text(output, encoding="utf-8")
+        _write_manifest(
+            run_dir,
+            original_filename=uploaded.filename,
+            source_hash=source_hash,
+            content_hash=_content_hash(df),
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
     action_token = _new_action_token(run_dir) if ok else ""
     return _render(
         message="Preview completed. Nothing has been sent." if ok else "Preview failed.",

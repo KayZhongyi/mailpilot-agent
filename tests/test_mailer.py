@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import smtplib
 from argparse import Namespace
@@ -529,3 +530,65 @@ def test_web_action_token_is_one_time(tmp_path):
     assert first.status_code == 200
     assert second.status_code == 200
     assert b"already used" in second.data
+
+
+def test_web_reopens_existing_batch_with_original_ledger(tmp_path):
+    run_dir, sendable, _token = _prepare_web_run(tmp_path, row_count=2)
+    rows = pd.read_csv(sendable, dtype=object).fillna("")
+    web_app._write_manifest(
+        run_dir,
+        source_hash="source-hash",
+        content_hash=web_app._content_hash(rows),
+    )
+    (run_dir / "preview.txt").write_text("preview", encoding="utf-8")
+    web_app.mailer._append_ledger(
+        web_app.mailer._default_ledger_path(str(sendable)),
+        {
+            "row": 0,
+            "email": "user0@example.com",
+            "status": "sent",
+            "send_time": "2026-07-13T12:00:00+08:00",
+        },
+    )
+    web_app.app.config.update(TESTING=True)
+
+    response = web_app.app.test_client().get(f"/runs/{run_dir.name}")
+
+    assert response.status_code == 200
+    assert b"Existing batch reopened" in response.data
+    assert b'<div class="label">Skipped</div><div class="value">1</div>' in response.data
+
+
+def test_web_duplicate_upload_reopens_original_batch(tmp_path):
+    web_app.RUNS_DIR = tmp_path
+    tmp_path.mkdir(exist_ok=True)
+    web_app.app.config.update(TESTING=True)
+    client = web_app.app.test_client()
+    csv_bytes = b"name,email,group\nAda,ada@example.com,confirmed\n"
+    form = {
+        "mode": "grouped",
+        "template": "default",
+        "email_col": "email",
+        "name_col": "name",
+        "group_col": "group",
+        "sent_col": "",
+        "confirm_no_history": "on",
+    }
+
+    first = client.post(
+        "/preview",
+        data={**form, "recipients": (io.BytesIO(csv_bytes), "people.csv")},
+        content_type="multipart/form-data",
+    )
+    runs_after_first = list(tmp_path.glob("mailpilot_*"))
+    second = client.post(
+        "/preview",
+        data={**form, "recipients": (io.BytesIO(csv_bytes), "people.csv")},
+        content_type="multipart/form-data",
+    )
+
+    assert first.status_code == 200
+    assert len(runs_after_first) == 1
+    assert second.status_code == 302
+    assert second.headers["Location"].endswith(f"/runs/{runs_after_first[0].name}")
+    assert list(tmp_path.glob("mailpilot_*")) == runs_after_first
