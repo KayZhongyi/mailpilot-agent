@@ -1,7 +1,7 @@
 ---
 name: mailpilot-agent
 description: "Crash-safe mail merge for AI agents. Give it a recipient list (optionally grouped by a column) and templates; it previews for review, sends in batches, is idempotent/resumable with an append-only ledger, and reconciles bounces. Great for status notifications, customer updates, and pre-sales follow-ups."
-version: 0.1.0
+version: 0.2.0
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -23,18 +23,21 @@ track whether each one was sent and delivered. **Two modes:**
 ## Core principles (important)
 
 - **The tool only faithfully sends the list you already grouped. It does not decide who belongs in which group.** Deciding the grouping is the user's job (optionally with the agent's help in chat).
+- If the user's CSV is not grouped yet, ask for explicit grouping rules, create a `group` / `template` column in a working copy, then run `preview`. Do not infer recipient segments silently.
+- Grouped mode maps each row's group value directly to a template file: `confirmed` -> `templates/confirmed.txt`, `waitlist` -> `templates/waitlist.txt`. Missing templates are preview errors and are never sent.
 - **Rows with no valid email, or whose template can't be found, are surfaced for review and are NEVER sent automatically.**
-- Sending is **idempotent and crash-safe**: `send` writes an append-only JSONL checkpoint after each SMTP result, then atomically syncs the CSV. Re-run after an interruption and it only sends what's left; rows marked "sent" in the list are skipped.
+- Sending is **fail-closed on interruption**: `send` writes `attempting` before SMTP, then appends the result and atomically syncs the CSV. A result that cannot be proven becomes `unknown` and is never retried automatically.
 - **`send` marking a row `sent` only means "the mail server accepted it" — NOT that it was delivered.** Always run `bounces` afterward to reconcile.
 
 ## Workflow the agent should follow
 
 1. **Self-check first**: run `doctor` to verify deps / config / SMTP. Fix what it flags — including that obtaining the email **app password** is a step the **user must do themselves** in their mail provider's settings (the agent can't log into their webmail / pass 2FA). Guide them using `references/email_provider_setup.md`, then write it into `config.yaml`.
-2. **Preview**: user provides the list → run `preview` → read the per-group counts + one sample per group + the flagged un-sendable rows **out loud in the chat** for the user to review (do NOT email a report).
-3. **Wait for confirmation**: only proceed after the user says "send" (they may give a time). Send nothing before that.
-4. **Test first**: `send --redirect-to <user's test inbox> --limit 3` so they see the real emails.
-5. **Send for real**: `send` (optionally `--at` to schedule, `--sleep` to throttle, `--only` per group). Report success/failure counts back.
-6. **Reconcile bounces**: run `bounces` to mark undelivered rows `bounced`, and report that list to the user (those need manual follow-up).
+2. **Prepare grouping if needed**: if the list already has a grouping column (`group`, `template`, `status`, `stage`, `segment`, `组别`, `报名状态`, etc.), use it. If not, ask the user for explicit rules and create a working CSV with a `group` column. The sending tool must not guess business segmentation on its own.
+3. **Preview**: user provides the list → run `preview` → read the per-group counts + one sample per group + the flagged un-sendable rows **out loud in the chat** for the user to review (do NOT email a report).
+4. **Wait for confirmation**: only proceed after the user says "send" (they may give a time). Send nothing before that.
+5. **Test first**: `send --redirect-to <user's test inbox> --limit 3` so they see the real emails. Redirected tests use a separate ledger and never mark customer rows as sent.
+6. **Send for real in bounded batches**: always provide `--limit` (maximum 200) and `--sleep` (minimum 1 second for production). Start with a small batch and report accepted/error/unknown counts back.
+7. **Reconcile bounces**: run `bounces` to mark undelivered rows `bounced`, and report that list to the user (those need manual follow-up).
 
 ## Command reference
 
@@ -54,7 +57,7 @@ python scripts/mailer.py preview samples/messy_registrations.csv --out sendable.
 python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to test@example.com --limit 3
 
 # Real send (idempotent; schedule / throttle / send one group)
-python scripts/mailer.py send --input sendable.csv --config config.yaml
+python scripts/mailer.py send --input sendable.csv --config config.yaml --limit 50 --sleep 2
 #   checkpoint ledger defaults to sendable.csv.sendlog.jsonl
 #   --at "2026-07-02 09:00"   send at a scheduled time (process must stay running)
 #   --sleep 2                 pause 2s between emails (throttle for large batches)
@@ -77,8 +80,8 @@ mailpilot send --input sendable.csv --config config.yaml --dry-run
 Needs at least an **email column** (headers containing "email"/"邮箱" are auto-detected). Optional:
 
 - **name column** — for the personalized greeting `{{ name }}`;
-- **group column** (headers containing "group"/"type"/"组别" etc.) — presence switches on grouped mode; the value = which template to use;
-- **sent column** (headers containing "sent"/"已发") — rows with a truthy value (`yes`/`1`/`是`/`sent`) are skipped, so you don't re-send ones already sent manually.
+- **group column** (headers containing "group"/"type"/"status"/"stage"/"segment"/"组别"/"报名状态" etc.) — presence switches on grouped mode; the value = which template to use;
+- **sent column** (headers exactly matching "sent"/"已发" aliases) — use explicit sent/unsent values. Blank or ambiguous history is blocked rather than assumed unsent.
 
 ## Templates
 
@@ -104,3 +107,4 @@ Plain text + Jinja2 variables, in `templates/`:
 
 - **Must run on a local-execution AI** (Claude Code / Cowork / Codex CLI / Hermes). Plain web chat sandboxes can't reach mail servers, so they can't actually send.
 - **Deliverability**: sending bulk to external/foreign inboxes from an ordinary mailbox may hit spam or rate limits. For one-off blasts of ~1000+, a transactional email service (Amazon SES / SendGrid / Mailgun / Aliyun DirectMail) delivers more reliably — switching only changes `config.yaml`. Always run `bounces` afterward.
+- **Business decisions stay upstream**: never infer installation, parallel-operation, fraud, rebate eligibility, or rejection reasons. A business owner must provide a reviewed decision/template column and trustworthy historical send status before MailPilot may send.

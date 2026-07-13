@@ -1,6 +1,6 @@
 name,email,group,sent
-Alice Chen,alice@example.com,confirmed,
-No Email,,confirmed,
-Bad Email,not-an-email,confirmed,
-VIP User,vip@example.com,vip,
+Alice Chen,alice@example.com,confirmed,no
+No Email,,confirmed,no
+Bad Email,not-an-email,confirmed,no
+VIP User,vip@example.com,vip,no
 Already Sent,old@example.com,waitlist,yes

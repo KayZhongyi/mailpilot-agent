@@ -1,13 +1,14 @@
 [project]
 name = "mailpilot-agent"
-version = "0.1.0"
-description = "Crash-safe mail merge for AI agents and CLI workflows."
+version = "0.2.0"
+description = "Crash-safe mail merge for teams, AI agents, and CLI workflows."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "MailPilot Agent contributors" }]
 dependencies = [
   "certifi",
+  "flask",
   "jinja2",
   "openpyxl",
   "pandas",

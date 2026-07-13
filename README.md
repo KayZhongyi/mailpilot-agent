@@ -1,8 +1,8 @@
 # MailPilot Agent
 
-**Crash-safe mail merge for AI agents.**
+**Crash-safe mail merge for teams and AI agents.**
 
-MailPilot Agent helps AI coding agents preview, send, resume, and reconcile personalized email batches from CSV/XLSX.
+MailPilot Agent helps teams and AI coding agents preview, send, resume, and reconcile personalized email batches from CSV/XLSX.
 
 It is designed for careful workflows like pre-sales follow-ups, event notifications, customer updates, and local-first automation.
 
@@ -11,13 +11,55 @@ It is designed for careful workflows like pre-sales follow-ups, event notificati
 ## Features
 
 - **Reads Excel/CSV** and auto-detects email, name, group, and sent-status columns.
-- **Simple and grouped modes**: send one template to everyone, or choose templates per row with a `group` column.
+- **Simple and grouped modes**: send one template to everyone, or let a grouping column choose templates automatically (`group=confirmed` -> `templates/confirmed.txt`).
 - **Preview before sending**: see per-group counts, rendered samples, and unsafe rows before any email goes out.
-- **Crash-safe resume**: writes an append-only JSONL checkpoint after every SMTP result.
+- **Fail-closed resume**: writes `attempting` before SMTP and the result afterward. An interrupted,
+  uncertain attempt becomes `unknown` and is never retried automatically.
 - **Safe testing**: use `--dry-run`, `--redirect-to`, and `--limit` before real sending.
 - **Schedule and throttle**: send later with `--at`, or slow down batches with `--sleep`.
 - **Bounce reconciliation**: scan bounce notifications through IMAP and mark undelivered rows.
 - **Local-first**: no SaaS account, no telemetry, no database required.
+- **Local web UI**: teammates can use a browser-based interface without any AI software.
+
+## Local Web UI
+
+For non-technical teammates, MailPilot includes a local browser UI.
+
+On macOS, double-click:
+
+```text
+run_mailpilot_app.command
+```
+
+On Windows, double-click:
+
+```text
+run_mailpilot_app.bat
+```
+
+Or run manually:
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+Then open the local URL shown in the terminal, usually:
+
+```text
+http://localhost:8501
+```
+
+The UI lets you:
+
+- upload a CSV/XLSX list
+- preview grouped or simple templates
+- inspect blocked rows before sending
+- inspect the local templates used by each group
+- run dry-runs or redirected test sends
+- require explicit confirmation before real sending
+
+No AI software is required for the web UI. Everything runs locally on your computer.
 
 ## Safety Demo
 
@@ -80,10 +122,12 @@ Test before sending:
 python scripts/mailer.py send --input sendable.csv --config config.yaml --redirect-to you@example.com --limit 3
 ```
 
-Send for real:
+Redirected tests use a separate test ledger and never mark customer rows as sent.
+
+Send for real in a reviewed batch (CLI maximum 200; local web UI maximum 100):
 
 ```bash
-python scripts/mailer.py send --input sendable.csv --config config.yaml
+python scripts/mailer.py send --input sendable.csv --config config.yaml --limit 50 --sleep 2
 ```
 
 Reconcile bounces:
@@ -128,7 +172,10 @@ During sending, it sends one email at a time and appends the result to a JSONL l
 sendable.csv.sendlog.jsonl
 ```
 
-If the process stops halfway through, run the same command again. MailPilot replays the ledger first and skips rows already accepted by SMTP.
+If the process stops halfway through, run the same command again. MailPilot replays the ledger first
+and skips rows already accepted by SMTP. If a process stopped after an attempt began but before a
+definite SMTP result was recorded, that row becomes `unknown` and requires manual reconciliation;
+MailPilot will not risk sending it twice automatically.
 
 The CSV is still updated for convenience, but it is written atomically instead of being rewritten after every single email.
 
@@ -139,9 +186,11 @@ The CSV is still updated for convenience, but it is written atomically instead o
 | `email` | yes | headers containing `email` / `邮箱` are auto-detected |
 | `name` | optional | used for `{{ name }}` in templates |
 | `group` | optional | enables grouped mode; value should match a template name |
-| `sent` | optional | truthy rows such as `yes`, `1`, `是`, `已发送` are skipped |
+| `sent` | optional | use explicit values such as `yes`/`no` or `已发送`/`未发送`; ambiguous or blank history is blocked |
 
-Chinese headers are supported for common fields such as email, name, group, and sent status.
+MailPilot also auto-detects common grouping headers such as `type`, `category`, `template`, `status`, `stage`, `segment`, `组别`, `报名状态`, and `客户阶段`.
+
+MailPilot does not guess business segmentation by itself. If your list is not grouped yet, ask your agent or spreadsheet rules to create a `group` / `template` column first, then preview before sending.
 
 ## Templates
 
@@ -170,11 +219,15 @@ templates/confirmed.txt
 templates/waitlist.txt
 ```
 
-In grouped mode, a row with `group=confirmed` uses:
+In grouped mode, the value in the grouping column maps directly to a template file name:
 
 ```text
-templates/confirmed.txt
+group=confirmed -> templates/confirmed.txt
+group=waitlist  -> templates/waitlist.txt
+group=vip       -> templates/vip.txt
 ```
+
+If a matching template does not exist, MailPilot blocks that row during preview instead of sending it.
 
 ## Common Commands
 
@@ -199,20 +252,23 @@ python scripts/mailer.py send --input sendable.csv --config config.yaml --redire
 Send only one group:
 
 ```bash
-python scripts/mailer.py send --input sendable.csv --config config.yaml --only confirmed
+python scripts/mailer.py send --input sendable.csv --config config.yaml --only confirmed --limit 50 --sleep 2
 ```
 
 Throttle sending:
 
 ```bash
-python scripts/mailer.py send --input sendable.csv --config config.yaml --sleep 2
+python scripts/mailer.py send --input sendable.csv --config config.yaml --limit 50 --sleep 2
 ```
 
 Schedule sending:
 
 ```bash
-python scripts/mailer.py send --input sendable.csv --config config.yaml --at "2026-07-02 09:00"
+python scripts/mailer.py send --input sendable.csv --config config.yaml --limit 50 --sleep 2 --at "2026-07-02 09:00"
 ```
+
+Every SMTP send requires a positive `--limit`. Production sending also requires at least one second
+between attempts. `0` never means unlimited.
 
 ## Configuration
 

@@ -1,0 +1,28 @@
+# Secrets — never commit
+config.yaml
+
+# Generated output (may contain real recipient emails + send status)
+sendable.csv
+*_send.csv
+*.out.csv
+*.sendlog.jsonl
+*.tmp
+.mailpilot_runs/
+
+# Real recipient lists — keep customer data out of the repo
+*.xlsx
+*.xls
+
+# Test / tooling
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
